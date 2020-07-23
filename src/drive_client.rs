@@ -1,0 +1,194 @@
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use hyper::client::HttpConnector;
+use hyper_rustls::HttpsConnector;
+use reqwest::{header, Client, RequestBuilder};
+use std::collections::HashMap;
+use std::future::Future;
+use yup_oauth2::authenticator::Authenticator;
+use yup_oauth2::{InstalledFlowAuthenticator, InstalledFlowReturnMethod};
+
+use serde::{Deserialize, Serialize};
+
+lazy_static! {
+    static ref SCOPES: [&'static str; 1] = ["https://www.googleapis.com/auth/drive",];
+    static ref GDRIVE_BASE_URL: &'static str = "https://www.googleapis.com/drive/v3";
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct FileList {
+    pub files: Vec<File>,
+    #[serde(alias = "nextPageToken")]
+    pub next_page_token: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DriveList {
+    pub drives: Vec<Drive>,
+    #[serde(alias = "nextPageToken")]
+    pub next_page_token: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct File {
+    pub id: String,
+    pub name: String,
+    pub parents: Vec<String>,
+    #[serde(alias = "createdTime")]
+    pub created_time: DateTime<Utc>,
+    #[serde(alias = "modifiedTime")]
+    pub modified_time: DateTime<Utc>,
+    #[serde(alias = "mimeType")]
+    pub mime_type: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Drive {
+    pub id: String,
+    pub name: String,
+    #[serde(alias = "colorRgb")]
+    pub color: String,
+    #[serde(alias = "createdTime")]
+    pub created_time: DateTime<Utc>,
+}
+
+pub struct DriveClient {
+    http_client: Client,
+    authenticator: Authenticator<HttpsConnector<HttpConnector>>,
+}
+
+impl DriveClient {
+    pub async fn create(credentials_path: &str) -> Result<Self> {
+        // Read the application secret
+        let secret = yup_oauth2::read_application_secret(credentials_path)
+            .await
+            .context("Unable to read credentials file.")?;
+
+        let auth =
+            InstalledFlowAuthenticator::builder(secret, InstalledFlowReturnMethod::HTTPRedirect)
+                .persist_tokens_to_disk("tokencache.json")
+                .build()
+                .await
+                .context("Unable to write token to disk for caching purposes")?;
+
+        Ok(Self {
+            http_client: Client::new(),
+            authenticator: auth,
+        })
+    }
+
+    async fn get_token(&self) -> Result<String> {
+        let token = self
+            .authenticator
+            .token(&*SCOPES)
+            .await
+            .context("Unable to get auth token")?;
+        Ok(String::from(token.as_str()))
+    }
+
+    async fn get_authenticated(&self, url: &str) -> Result<RequestBuilder> {
+        let token = self.get_token().await?;
+        dbg!(&token);
+        Ok(self
+            .http_client
+            .get(format!("{}{}", *GDRIVE_BASE_URL, url).as_str())
+            .header(header::AUTHORIZATION, format!("Bearer {}", token)))
+    }
+
+    pub async fn get_files_in_parent(&self, parent_id: &str) -> Result<Vec<File>> {
+        let mut all_files = vec![];
+
+        let mut has_more = true;
+        let mut page_token: Option<String> = None;
+
+        let query = format!("parents in \"{}\"", parent_id);
+
+        // instead of making the user responsible of fetching all pages, we just give him a vector with all the files.
+        // this means, that we need to do the page handling ourselves.
+        while has_more {
+            let mut request = self.get_authenticated("/files").await?;
+            let mut params = vec![
+                ("supportsAllDrives".to_string(), "true".to_string()),
+                ("corpora".to_string(), "allDrives".to_string()),
+                ("includeItemsFromAllDrives".to_string(), "true".to_string()),
+                ("orderBy".to_string(), "folder, createdTime".to_string()),
+                (
+                    "fields".to_string(),
+                    "files(id, name, mimeType, parents, createdTime, modifiedTime)".to_string(),
+                ),
+                ("pageSize".to_string(), "1000".to_string()),
+                ("q".to_string(), query.clone()),
+            ]
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+
+            if let Some(tok) = page_token.clone() {
+                params.insert("pageToken".to_string(), tok);
+            }
+
+            request = request.query(&params);
+            let mut files: FileList = request.send().await?.json().await?;
+            all_files.append(files.files.as_mut());
+
+            if let Some(new_page_token) = files.next_page_token {
+                has_more = true;
+                page_token = Some(new_page_token);
+            } else {
+                has_more = false;
+            }
+        }
+
+        Ok(all_files)
+    }
+
+    pub async fn get_drives(&self) -> Result<Vec<Drive>> {
+        let request = self.get_authenticated("/drives").await?;
+        let params = vec![
+            ("pageSize".to_string(), "100".to_string()),
+            ("fields".to_string(), "*".to_string()),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        let drive_list: DriveList = request.query(&params).send().await?.json().await?;
+
+        Ok(drive_list.drives)
+    }
+
+    pub async fn process_all_files<F>(&self, callback: F) -> Result<()>
+        where F: Fn(File) -> ()
+    {
+        let drives = self.get_drives().await?;
+
+        let mut tasks = vec![];
+        for drive in drives {
+            tasks.push(self.process_folder_recursively(drive.id.clone(), &callback));
+        }
+
+        for task in tasks {
+            task.await?;
+        }
+
+        Ok(())
+    }
+
+    async fn process_folder_recursively<F>(&self, parent_id: String, callback: &F) -> Result<()>
+        where F: Fn(File) -> ()
+    {
+        let files = self.get_files_in_parent(&parent_id).await.expect("Unable to get files in drive.");
+        let mut tasks = vec![];
+        files.into_iter().for_each(|file| {
+            callback(file.clone());
+
+            if file.mime_type == "application/vnd.google-apps.folder" {
+                tasks.push(self.process_folder_recursively(file.id, callback));
+            }
+        });
+
+        for task in tasks {
+            task.await?;
+        }
+
+        Ok(())
+    }
+}
