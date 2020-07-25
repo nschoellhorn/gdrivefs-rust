@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use futures::future::{FutureExt, LocalBoxFuture};
 use hyper::client::HttpConnector;
 use hyper_rustls::HttpsConnector;
 use reqwest::{header, Client, RequestBuilder};
@@ -7,7 +8,6 @@ use std::collections::HashMap;
 use std::future::Future;
 use yup_oauth2::authenticator::Authenticator;
 use yup_oauth2::{InstalledFlowAuthenticator, InstalledFlowReturnMethod};
-use futures::future::{LocalBoxFuture, FutureExt};
 
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +41,7 @@ pub struct File {
     pub modified_time: DateTime<Utc>,
     #[serde(alias = "mimeType")]
     pub mime_type: String,
+    pub size: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -96,6 +97,27 @@ impl DriveClient {
             .header(header::AUTHORIZATION, format!("Bearer {}", token)))
     }
 
+    pub async fn get_file_content(
+        &self,
+        file_id: &str,
+        byte_from: u64,
+        byte_to: u64,
+    ) -> Result<bytes::Bytes> {
+        let mut request = self
+            .get_authenticated(format!("/files/{}", file_id).as_str())
+            .await?;
+        let params = vec![
+            ("alt".to_string(), "media".to_string()),
+            ("supportsAllDrives".to_string(), "true".to_string()),
+        ];
+
+        request = request
+            .header("Range", format!("bytes={}-{}", byte_from, byte_to).as_str())
+            .query(&params);
+
+        Ok(request.send().await?.bytes().await?)
+    }
+
     pub async fn get_files_in_parent(&self, parent_id: &str) -> Result<Vec<File>> {
         let mut all_files = vec![];
 
@@ -112,10 +134,14 @@ impl DriveClient {
                 ("supportsAllDrives".to_string(), "true".to_string()),
                 ("corpora".to_string(), "allDrives".to_string()),
                 ("includeItemsFromAllDrives".to_string(), "true".to_string()),
-                ("orderBy".to_string(), "folder desc, createdTime".to_string()),
+                (
+                    "orderBy".to_string(),
+                    "folder desc, createdTime".to_string(),
+                ),
                 (
                     "fields".to_string(),
-                    "files(id, name, mimeType, parents, createdTime, modifiedTime)".to_string(),
+                    "files(id, name, mimeType, parents, createdTime, modifiedTime, size)"
+                        .to_string(),
                 ),
                 ("pageSize".to_string(), "1000".to_string()),
                 ("q".to_string(), query.clone()),
@@ -157,7 +183,8 @@ impl DriveClient {
     }
 
     pub async fn process_all_files<'a, F>(&'a self, callback: impl Fn(File) -> F) -> Result<()>
-        where F: Future<Output = Result<()>>
+    where
+        F: Future<Output = Result<()>>,
     {
         let drives = self.get_drives().await?;
         let callback_ref = &callback;
@@ -175,18 +202,26 @@ impl DriveClient {
         Ok(())
     }
 
-    fn process_folder_recursively<'a, F>(&'a self, parent_id: String, callback: &'a impl Fn(File) -> F) -> LocalBoxFuture<'a, Result<()>>
-        where F: Future<Output = Result<()>>
+    pub(crate) fn process_folder_recursively<'a, F>(
+        &'a self,
+        parent_id: String,
+        callback: &'a impl Fn(File) -> F,
+    ) -> LocalBoxFuture<'a, Result<()>>
+    where
+        F: Future<Output = Result<()>>,
     {
         async move {
-            let files = self.get_files_in_parent(&parent_id).await.expect("Unable to get files in drive.");
+            let files = self
+                .get_files_in_parent(&parent_id)
+                .await
+                .expect("Unable to get files in drive.");
             let mut tasks = vec![];
             let mut tasks2 = vec![];
             files.into_iter().for_each(|file| {
                 tasks.push(callback(file.clone()));
 
                 if file.mime_type == "application/vnd.google-apps.folder" {
-                    tasks2.push(self.process_folder_recursively(file.id, callback)); 
+                    tasks2.push(self.process_folder_recursively(file.id, callback));
                 }
             });
 
@@ -199,6 +234,7 @@ impl DriveClient {
             }
 
             Ok(())
-        }.boxed_local()
+        }
+        .boxed_local()
     }
 }
