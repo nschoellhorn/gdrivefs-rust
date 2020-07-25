@@ -1,3 +1,5 @@
+#![feature(async_closure)]
+
 #[macro_use]
 extern crate lazy_static;
 
@@ -14,8 +16,10 @@ lazy_static! {
 async fn main() -> Result<()> {
     let drive_client = DriveClient::create(*CREDENTIALS_PATH).await?;
 
-    let full_index_task = drive_client.process_all_files(|file| {
+    let full_index_task = drive_client.process_all_files(async move |file| {
         dbg!(file);
+
+        Ok(())
     });
 
     full_index_task.await?;

@@ -285,6 +285,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "config",
+ "futures",
  "hyper",
  "hyper-rustls",
  "lazy_static",
