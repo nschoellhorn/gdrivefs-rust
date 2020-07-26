@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::future::Future;
 use yup_oauth2::authenticator::Authenticator;
 use yup_oauth2::{InstalledFlowAuthenticator, InstalledFlowReturnMethod};
+use std::cell::Cell;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
@@ -17,50 +19,75 @@ lazy_static! {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct FileList {
     pub files: Vec<File>,
-    #[serde(alias = "nextPageToken")]
     pub next_page_token: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct DriveList {
     pub drives: Vec<Drive>,
-    #[serde(alias = "nextPageToken")]
     pub next_page_token: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Change {
+    pub r#type: String,
+    pub change_type: String,
+    pub time: DateTime<Utc>,
+    pub removed: bool,
+    pub fileId: Option<String>,
+    pub file: Option<File>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeList {
+    pub next_page_token: Option<String>,
+    pub new_start_page_token: Option<String>,
+    pub changes: Vec<Change>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct File {
     pub id: String,
     pub name: String,
     pub parents: Vec<String>,
-    #[serde(alias = "createdTime")]
     pub created_time: DateTime<Utc>,
-    #[serde(alias = "modifiedTime")]
     pub modified_time: DateTime<Utc>,
-    #[serde(alias = "mimeType")]
     pub mime_type: String,
     pub size: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct Drive {
     pub id: String,
     pub name: String,
     #[serde(alias = "colorRgb")]
     pub color: String,
-    #[serde(alias = "createdTime")]
     pub created_time: DateTime<Utc>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+struct StartPageToken {
+    start_page_token: String,
 }
 
 pub struct DriveClient {
     http_client: Client,
+    blocking_client: reqwest::blocking::Client,
     authenticator: Authenticator<HttpsConnector<HttpConnector>>,
+    token: Arc<Mutex<Cell<String>>>,
 }
 
 impl DriveClient {
-    pub async fn create(credentials_path: &str) -> Result<Self> {
+    pub async fn create(credentials_path: &str, blocking_client: reqwest::blocking::Client) -> Result<Self> {
         // Read the application secret
         let secret = yup_oauth2::read_application_secret(credentials_path)
             .await
@@ -75,7 +102,9 @@ impl DriveClient {
 
         Ok(Self {
             http_client: Client::new(),
+            blocking_client,
             authenticator: auth,
+            token: Arc::new(Mutex::new(Cell::new(String::new()))),
         })
     }
 
@@ -85,27 +114,90 @@ impl DriveClient {
             .token(&*SCOPES)
             .await
             .context("Unable to get auth token")?;
-        Ok(String::from(token.as_str()))
+
+        let token = String::from(token.as_str());
+
+        self.token.lock().unwrap().set(token.clone());
+
+        Ok(token)
     }
 
     async fn get_authenticated(&self, url: &str) -> Result<RequestBuilder> {
         let token = self.get_token().await?;
         //dbg!(&token);
+        println!("Got Token");
         Ok(self
             .http_client
             .get(format!("{}{}", *GDRIVE_BASE_URL, url).as_str())
             .header(header::AUTHORIZATION, format!("Bearer {}", token)))
     }
 
-    pub async fn get_file_content(
+    fn get_authenticated_blocking(&self, url: &str) -> Result<reqwest::blocking::RequestBuilder> {
+        let lock = self.token.lock().unwrap();
+        let token = lock.take();
+        lock.set(token.clone());
+
+        //dbg!(&token);
+        println!("Got Token");
+        Ok(self
+            .blocking_client
+            .get(format!("{}{}", *GDRIVE_BASE_URL, url).as_str())
+            .header(header::AUTHORIZATION, format!("Bearer {}", token)))
+    }
+
+    pub async fn get_start_page_token(&self, drive_id: &str) -> Result<String> {
+        Ok(self
+            .get_authenticated("/changes/startPageToken")
+            .await?
+            .query(&vec![
+                ("driveId", drive_id),
+                ("supportsAllDrives", "true"),
+                ("fields", "startPageToken"),
+            ])
+            .send()
+            .await?
+            .json::<StartPageToken>()
+            .await?
+            .start_page_token)
+    }
+
+    pub async fn get_change_list(&self, page_token: &str, drive_id: &str) -> Result<ChangeList> {
+        let response = self.get_authenticated("/changes").await?
+                .query(&vec![
+                    ("pageToken", page_token),
+                    ("includeItemsFromAllDrives", "true"),
+                    ("supportsAllDrives", "true"),
+                    ("driveId", drive_id),
+                    ("fields", "nextPageToken, newStartPageToken, changes(type, changeType, time, removed, fileId, file(id, name, mimeType, parents, createdTime, modifiedTime, size))"),
+                    ("pageSize", "1000"),
+                ]).send().await;
+
+        if response.is_err() {
+            let err = response.unwrap_err();
+            dbg!(&err);
+            return Err(anyhow::Error::new(err));
+        }
+
+        let response = response.unwrap();
+
+        dbg!(&response);
+
+        if !response.status().is_success() {
+            dbg!(response.text().await?);
+            return Err(anyhow::Error::msg("Something went wrong"));
+        }
+
+        Ok(response.json().await?)
+    }
+
+    pub fn get_file_content(
         &self,
         file_id: &str,
         byte_from: u64,
         byte_to: u64,
     ) -> Result<bytes::Bytes> {
         let mut request = self
-            .get_authenticated(format!("/files/{}", file_id).as_str())
-            .await?;
+            .get_authenticated_blocking(format!("/files/{}", file_id).as_str())?;
         let params = vec![
             ("alt".to_string(), "media".to_string()),
             ("supportsAllDrives".to_string(), "true".to_string()),
@@ -115,7 +207,13 @@ impl DriveClient {
             .header("Range", format!("bytes={}-{}", byte_from, byte_to).as_str())
             .query(&params);
 
-        Ok(request.send().await?.bytes().await?)
+        let response = request.send().context("Network failure or something")?;
+        if !response.status().is_success() {
+            dbg!(response.text()?);
+            return Err(anyhow::Error::msg("Something went wrong"));
+        }
+
+        Ok(response.bytes()?)
     }
 
     pub async fn get_files_in_parent(&self, parent_id: &str) -> Result<Vec<File>> {

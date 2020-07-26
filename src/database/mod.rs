@@ -9,6 +9,7 @@ use diesel_derive_enum::DbEnum;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::sync::Mutex;
+use anyhow::Result;
 
 use diesel::prelude::*;
 
@@ -27,7 +28,7 @@ pub enum RemoteType {
     File,
 }
 
-#[derive(Queryable, Insertable)]
+#[derive(Debug, Queryable, Insertable)]
 #[table_name = "filesystem"]
 pub struct FilesystemEntry {
     pub inode: i64,
@@ -59,6 +60,15 @@ impl FilesystemRepository {
             .unwrap();
 
         largest_inode.unwrap_or(0)
+    }
+
+    pub(crate) fn find_parent_inode(&self, i: i64) -> Option<i64> {
+        filesystem
+            .select(parent_inode)
+            .filter(inode.eq(i))
+            .first::<i64>(&*self.connection.lock().unwrap())
+            .optional()
+            .expect("Unable to search for parent inode")
     }
 
     pub(crate) fn find_inode_by_remote_id(&self, rid: &str) -> Option<i64> {
@@ -123,6 +133,7 @@ impl FilesystemRepository {
     pub(crate) fn find_all_entries_in_parent(&self, parent_i: u64) -> Vec<FilesystemEntry> {
         filesystem
             .filter(parent_inode.eq(parent_i as i64))
+            .order_by(inode)
             .load::<FilesystemEntry>(&*self.connection.lock().unwrap())
             .expect("Error searching filesystem entry")
     }
@@ -142,5 +153,13 @@ impl FilesystemRepository {
             .values(fs_entry)
             .execute(&*self.connection.lock().unwrap())
             .expect("Unable to insert new entry");
+    }
+
+    pub(crate) fn remove_entry_by_remote_id(&self, rid: &str) -> Result<()> {
+        diesel::delete(filesystem::table)
+            .filter(remote_id.eq(rid))
+            .execute(&*self.connection.lock().unwrap())?;
+
+        Ok(())
     }
 }

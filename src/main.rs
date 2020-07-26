@@ -11,11 +11,11 @@ mod drive_client;
 mod filesystem;
 
 use crate::database::{EntryType, FilesystemEntry, FilesystemRepository, RemoteType};
-use crate::drive_client::{DriveClient, File};
+use crate::drive_client::{Change, ChangeList, DriveClient, File};
 use crate::filesystem::GdriveFs;
 use anyhow::Result;
-use chrono::naive::NaiveDateTime;
 use diesel::prelude::*;
+use std::io::prelude::*;
 use std::io::stdin;
 use std::sync::Arc;
 
@@ -25,7 +25,13 @@ lazy_static! {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let drive_client = Arc::new(DriveClient::create(*CREDENTIALS_PATH).await?);
+    simple_logger::init().unwrap();
+
+    let blocking_client = tokio::task::spawn_blocking(|| {
+        reqwest::blocking::Client::new()
+    }).await?;
+
+    let drive_client = Arc::new(DriveClient::create(*CREDENTIALS_PATH, blocking_client).await?);
     let mut drives = drive_client.get_drives().await?;
     let test_drive = drives.remove(2);
 
@@ -37,7 +43,7 @@ async fn main() -> Result<()> {
         repository.create_entry(&FilesystemEntry {
             inode: repository.get_largest_inode() + 1,
             parent_inode: filesystem::SHARED_DRIVES_INODE as i64,
-            name: test_drive.name,
+            name: test_drive.name.clone(),
             entry_type: EntryType::Directory,
             created_at: test_drive.created_time.naive_local(),
             last_modified_at: test_drive.created_time.naive_local(),
@@ -49,51 +55,164 @@ async fn main() -> Result<()> {
 
     let filesystem = GdriveFs::new(Arc::clone(&repository), Arc::clone(&drive_client));
 
-    println!("Indexing the drive.");
-    let repository_ref = &repository;
-    drive_client
-        .process_folder_recursively(test_drive.id, &async move |file| {
-            let indexing_repo = Arc::clone(repository_ref);
-            let parent_id = file.parents.first().unwrap();
-            let remote_id = file.id;
+    println!("Indexing drive changes...");
+    let mut state_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .read(true)
+        .open("state.txt")?;
 
-            if let None = indexing_repo.find_inode_by_remote_id(remote_id.as_str()) {
-                indexing_repo.create_entry(&FilesystemEntry {
-                    inode: indexing_repo.get_largest_inode() + 1,
-                    parent_inode: indexing_repo
-                        .find_inode_by_remote_id(parent_id.as_str())
-                        .unwrap(),
-                    name: file.name,
-                    entry_type: match file.mime_type.as_str() {
-                        "application/vnd.google-apps.folder" => EntryType::Directory,
-                        _ => EntryType::File,
-                    },
-                    created_at: file.created_time.naive_local(),
-                    last_modified_at: file.modified_time.naive_local(),
-                    remote_type: Some(match file.mime_type.as_str() {
-                        "application/vnd.google-apps.folder" => RemoteType::Directory,
-                        _ => RemoteType::File,
-                    }),
-                    remote_id: Some(remote_id),
-                    size: file
-                        .size
-                        .unwrap_or("0".to_string())
-                        .as_str()
-                        .parse()
-                        .unwrap_or(0),
-                })
+    let mut current_token = String::new();
+    state_file.read_to_string(&mut current_token)?;
+
+    state_file.seek(std::io::SeekFrom::Start(0))?;
+
+    current_token = current_token.trim().to_string();
+
+    if current_token.is_empty() {
+        current_token = "1".to_string();
+    }
+
+    println!("Starting with page token {}", &current_token);
+
+    async_scoped::scope_and_block(|scope| {
+        let mut has_more = true;
+        let repo_ref = &repository;
+        let drive_id = test_drive.id.as_str();
+        while has_more {
+            let current_token_str = current_token.as_str();
+            let (_, mut change_list) = async_scoped::scope_and_block(|inner_scope| {
+                let drive_client = Arc::clone(&drive_client);
+                inner_scope.spawn(async move {
+                    let result = drive_client
+                        .get_change_list(current_token_str, drive_id)
+                        .await;
+
+                    if let Err(error) = result {
+                        println!("Got error while fetching changes");
+                        dbg!(error);
+                        return ChangeList {
+                            next_page_token: None,
+                            new_start_page_token: None,
+                            changes: vec![],
+                        };
+                    }
+
+                    result.unwrap()
+                });
+            });
+            let change_list = change_list.remove(0);
+            let changes = change_list.changes;
+
+            scope.spawn(async move {
+                let mut changes = changes
+                    .into_iter()
+                    .filter(|change| change.r#type == "file")
+                    .collect::<Vec<_>>();
+                changes.sort_by(|a, b| {
+                    let datetime_a = match a.file {
+                        Some(ref f) => f.created_time,
+                        None => a.time,
+                    };
+
+                    let datetime_b = match b.file {
+                        Some(ref f) => f.created_time,
+                        None => b.time,
+                    };
+
+                    datetime_a.cmp(&datetime_b)
+                });
+
+                changes
+                    .into_iter()
+                    .for_each(|change| process_change(change, Arc::clone(repo_ref)))
+            });
+
+            has_more = change_list.next_page_token.is_some();
+            if has_more {
+                current_token = change_list.next_page_token.unwrap();
+                state_file
+                    .write_all(current_token.as_bytes())
+                    .expect("Unable to write new state to file");
+            } else {
+                state_file
+                    .write_all(
+                        change_list
+                            .new_start_page_token
+                            .expect(
+                                "Next Start Page Token Not Found, this seems like an logic bug.",
+                            )
+                            .as_bytes(),
+                    )
+                    .expect("Unable to write new state to file");
             }
 
-            Ok(())
-        })
-        .await?;
-    println!("Indexing finished.");
+            state_file.flush().expect("Unable to flush state file");
+        }
+    });
 
-    let mount_handle =
-        unsafe { fuse::spawn_mount(filesystem, "/home/nschoellhorn/testfs", &[]) }.unwrap();
+    println!("Finished indexing, mounting file system.");
+
+    let handle = tokio::task::spawn_blocking(|| {
+        fuse::mount(filesystem, "/home/nschoellhorn/testfs", &[])
+            .expect("unable to mount FUSE filesystem");
+    });
 
     let mut input = String::new();
     stdin().read_line(&mut input).unwrap();
 
+    let mut command = std::process::Command::new("fusermount");
+    command.arg("-u").arg("/home/nschoellhorn/testfs");
+
+    command.spawn().unwrap().wait().expect("Filesystem wasn't unmounted successfully, try running this yourself: fusermount -u /home/nschoellhorn/testfs");
+
+    handle.await?;
+
     Ok(())
+}
+
+fn process_change(change: Change, indexing_repo: Arc<FilesystemRepository>) {
+    if change.removed {
+        process_delete(change.fileId.unwrap(), indexing_repo);
+    } else {
+        process_create(change.file.unwrap(), indexing_repo);
+    }
+}
+
+fn process_delete(remote_id: String, indexing_repo: Arc<FilesystemRepository>) {
+    indexing_repo
+        .remove_entry_by_remote_id(remote_id.as_str())
+        .expect("Unable to execute delete.");
+}
+
+fn process_create(file: File, indexing_repo: Arc<FilesystemRepository>) {
+    let parent_id = file.parents.first().unwrap();
+    let remote_id = file.id;
+
+    if let None = indexing_repo.find_inode_by_remote_id(remote_id.as_str()) {
+        indexing_repo.create_entry(&FilesystemEntry {
+            inode: indexing_repo.get_largest_inode() + 1,
+            parent_inode: indexing_repo
+                .find_inode_by_remote_id(parent_id.as_str())
+                .unwrap(),
+            name: file.name,
+            entry_type: match file.mime_type.as_str() {
+                "application/vnd.google-apps.folder" => EntryType::Directory,
+                _ => EntryType::File,
+            },
+            created_at: file.created_time.naive_local(),
+            last_modified_at: file.modified_time.naive_local(),
+            remote_type: Some(match file.mime_type.as_str() {
+                "application/vnd.google-apps.folder" => RemoteType::Directory,
+                _ => RemoteType::File,
+            }),
+            remote_id: Some(remote_id),
+            size: file
+                .size
+                .unwrap_or("0".to_string())
+                .as_str()
+                .parse()
+                .unwrap_or(0),
+        })
+    }
 }

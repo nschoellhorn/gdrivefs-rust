@@ -153,24 +153,33 @@ impl Filesystem for GdriveFs {
             return;
         }
 
-        let remote_id = remote_id.unwrap();
+        let remote_id = remote_id.unwrap().clone();
 
-        let client = &self.drive_client;
-        async_scoped::scope_and_block(|scope| {
-            scope.spawn(async move {
-                let data = client
-                    .get_file_content(
-                        remote_id.as_str(),
-                        _offset as u64,
-                        (_offset + _size as i64) as u64,
-                    )
-                    .await
-                    .expect("Unable to retrieve file content");
+        println!(
+            "READ CALLED - Offset: {}, Size: {}K, Inode: {}",
+            _offset,
+            _size / 1024,
+            _ino
+        );
+        let client = Arc::clone(&self.drive_client);
+        let data = client
+            .get_file_content(
+                remote_id.as_str(),
+                _offset as u64,
+                (_offset + _size as i64) as u64,
+            )
+            .expect("Unable to retrieve file content");
 
-                use std::borrow::Borrow;
-                reply.data(data.borrow());
-            });
-        });
+        use std::borrow::Borrow;
+        println!(
+            "Replying with some data for this request :: Offset: {}, Size: {}K, Inode: {}",
+            _offset,
+            _size / 1024,
+            _ino
+        );
+        println!("Our reply is {}K long", data.len() / 1024);
+        dbg!(&data);
+        reply.data(data.borrow());
     }
 
     fn lookup(
@@ -187,7 +196,7 @@ impl Filesystem for GdriveFs {
         match entry {
             Some(fs_entry) => reply.entry(&TTL, &get_attr(&fs_entry), 0),
             None => {
-                println!(
+                /*println!(
                     r#"
                     Call Errored: lookup()
                     Request: {:?}
@@ -195,7 +204,7 @@ impl Filesystem for GdriveFs {
                     Entry Name: {:?}
                     "#,
                     request, parent_inode, entry_name
-                );
+                );*/
 
                 reply.error(ENOENT)
             }
@@ -247,20 +256,23 @@ impl Filesystem for GdriveFs {
         let inode_exists = self.repository.inode_exists(inode);
         if inode_exists {
             if offset < 1 {
-                reply.add(1, 1, FileType::Directory, ".");
+                reply.add(inode, 1, FileType::Directory, ".");
             }
 
             if offset < 2 {
-                reply.add(1, 2, FileType::Directory, "..");
+                let parent_inode =
+                    self.repository.find_parent_inode(inode as i64).unwrap_or(1) as u64;
+                reply.add(parent_inode, 2, FileType::Directory, "..");
             }
         }
 
-        self.repository
-            .find_all_entries_in_parent(inode)
+        let results = self.repository.find_all_entries_in_parent(inode);
+
+        results
             .iter()
             .enumerate()
             .skip(offset as usize)
-            .for_each(|(_, entry)| {
+            .for_each(|(offset, entry)| {
                 reply.add(
                     entry.inode as u64,
                     (offset + 2) as i64,
