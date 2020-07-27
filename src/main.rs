@@ -25,7 +25,7 @@ lazy_static! {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    simple_logger::init().unwrap();
+    simple_logger::init_with_level(log::Level::Info).unwrap();
 
     let blocking_client = tokio::task::spawn_blocking(|| {
         reqwest::blocking::Client::new()

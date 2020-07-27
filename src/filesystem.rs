@@ -156,9 +156,9 @@ impl Filesystem for GdriveFs {
         let remote_id = remote_id.unwrap().clone();
 
         println!(
-            "READ CALLED - Offset: {}, Size: {}K, Inode: {}",
+            "READ CALLED - Offset: {}, Size: {}, Inode: {}",
             _offset,
-            _size / 1024,
+            _size,
             _ino
         );
         let client = Arc::clone(&self.drive_client);
@@ -166,19 +166,18 @@ impl Filesystem for GdriveFs {
             .get_file_content(
                 remote_id.as_str(),
                 _offset as u64,
-                (_offset + _size as i64) as u64,
+                (_offset + _size as i64) as u64 - 1,
             )
             .expect("Unable to retrieve file content");
 
         use std::borrow::Borrow;
         println!(
-            "Replying with some data for this request :: Offset: {}, Size: {}K, Inode: {}",
+            "Replying with some data for this request :: Offset: {}, Size: {}, Inode: {}",
             _offset,
-            _size / 1024,
+            _size,
             _ino
         );
-        println!("Our reply is {}K long", data.len() / 1024);
-        dbg!(&data);
+        println!("Our reply is {} long", data.len());
         reply.data(data.borrow());
     }
 
