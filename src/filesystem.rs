@@ -132,7 +132,7 @@ impl Filesystem for GdriveFs {
             return;
         }
 
-        let file_handle = self.make_file_handle(fs_entry.unwrap().remote_id.unwrap());
+        let file_handle = self.make_file_handle(fs_entry.unwrap().id);
         reply.opened(file_handle, _flags);
     }
 

@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
 
     let drive_client = Arc::new(DriveClient::create(*CREDENTIALS_PATH, blocking_client).await?);
     let mut drives = drive_client.get_drives().await?;
-    let test_drive = drives.remove(2);
+    let test_drive = drives.remove(1);
 
     dbg!(&test_drive);
 
@@ -194,7 +194,7 @@ fn process_create(file: File, indexing_repo: Arc<FilesystemRepository>) {
             inode: indexing_repo.get_largest_inode() + 1,
             parent_inode: indexing_repo
                 .find_inode_by_remote_id(parent_id.as_str())
-                .unwrap(),
+                .expect(format!("Unable to find inode for remote id {}", parent_id.as_str()).as_str()),
             name: file.name,
             entry_type: match file.mime_type.as_str() {
                 "application/vnd.google-apps.folder" => EntryType::Directory,

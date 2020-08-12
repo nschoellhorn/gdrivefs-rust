@@ -31,15 +31,15 @@ pub enum RemoteType {
 #[derive(Debug, Queryable, Insertable)]
 #[table_name = "filesystem"]
 pub struct FilesystemEntry {
-    pub inode: i64,
-    pub parent_inode: i64,
+    pub id: String,
     pub name: String,
     pub entry_type: EntryType,
     pub created_at: NaiveDateTime,
     pub last_modified_at: NaiveDateTime,
     pub remote_type: Option<RemoteType>,
-    pub remote_id: Option<String>,
+    pub inode: Option<i64>,
     pub size: i64,
+    pub parent_id: Option<String>,
 }
 
 pub struct FilesystemRepository {
@@ -62,13 +62,14 @@ impl FilesystemRepository {
         largest_inode.unwrap_or(0)
     }
 
-    pub(crate) fn find_parent_inode(&self, i: i64) -> Option<i64> {
+    pub(crate) fn find_parent_id(&self, i: String) -> Option<String> {
         filesystem
-            .select(parent_inode)
-            .filter(inode.eq(i))
-            .first::<i64>(&*self.connection.lock().unwrap())
+            .select(parent_id)
+            .filter(id.eq(i))
+            .first::<Option<String>>(&*self.connection.lock().unwrap())
             .optional()
             .expect("Unable to search for parent inode")
+            .flatten()
     }
 
     pub(crate) fn find_inode_by_remote_id(&self, rid: &str) -> Option<i64> {
