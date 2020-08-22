@@ -28,7 +28,7 @@ pub enum RemoteType {
     File,
 }
 
-#[derive(Debug, Queryable, Insertable)]
+#[derive(Debug, Queryable, Insertable, QueryableByName)]
 #[table_name = "filesystem"]
 pub struct FilesystemEntry {
     pub id: String,
@@ -37,7 +37,7 @@ pub struct FilesystemEntry {
     pub created_at: NaiveDateTime,
     pub last_modified_at: NaiveDateTime,
     pub remote_type: Option<RemoteType>,
-    pub inode: Option<i64>,
+    pub inode: i64,
     pub size: i64,
     pub parent_id: Option<String>,
 }
@@ -75,7 +75,7 @@ impl FilesystemRepository {
     pub(crate) fn find_inode_by_remote_id(&self, rid: &str) -> Option<i64> {
         filesystem
             .select(inode)
-            .filter(remote_id.eq(rid))
+            .filter(id.eq(rid))
             .limit(1)
             .first::<i64>(&*self.connection.lock().unwrap())
             .optional()
@@ -84,29 +84,27 @@ impl FilesystemRepository {
 
     pub(crate) fn get_remote_inode_mapping(&self) -> HashMap<String, i64> {
         filesystem
-            .select((remote_id, inode))
-            .filter(remote_id.is_not_null())
-            .load::<(Option<String>, i64)>(&*self.connection.lock().unwrap())
+            .select((id, inode))
+            .load::<(String, i64)>(&*self.connection.lock().unwrap())
             .expect("Unable to load cached remote inode mapping")
             .into_iter()
-            .filter(|(rid, _)| rid.is_some())
-            .map(|(rid, i)| (rid.unwrap(), i))
             .collect()
     }
 
     pub(crate) fn find_entry_as_child(
         &self,
-        parent_i: u64,
+        parent_i: i64,
         entry_name: &OsStr,
     ) -> Option<FilesystemEntry> {
         let real_str = entry_name.to_str().unwrap();
 
-        filesystem
-            .filter(parent_inode.eq(parent_i as i64))
-            .filter(name.eq(real_str))
-            .first::<FilesystemEntry>(&*self.connection.lock().unwrap())
+        diesel::sql_query("SELECT * FROM filesystem AS fs_parent JOIN filesystem AS fs_root ON (fs_root.parent_id = fs_parent.id) WHERE fs_parent=?")
+            .bind::<diesel::sql_types::Integer, _>(parent_i)
+            .get_results::<FilesystemEntry>(&self.connection)
             .optional()
             .expect("Error searching filesystem entry")
+            .map(|vec| vec.into_iter().nth(0))
+            .flatten()
     }
 
     pub(crate) fn find_entry_for_inode(&self, i: u64) -> Option<FilesystemEntry> {

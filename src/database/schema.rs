@@ -10,7 +10,7 @@ table! {
         created_at -> Timestamp,
         last_modified_at -> Timestamp,
         remote_type -> Nullable<RemoteTypeMapping>,
-        inode -> Nullable<BigInt>,
+        inode -> BigInt,
         parent_id -> Nullable<Text>,
         size -> BigInt,
     }
