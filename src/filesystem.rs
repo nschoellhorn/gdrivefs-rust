@@ -191,7 +191,7 @@ impl Filesystem for GdriveFs {
         // We need to look up top level directories, which are the drives in our case
         let entry = self
             .repository
-            .find_entry_as_child(parent_inode, entry_name);
+            .find_entry_as_child(parent_inode as i64, entry_name);
         match entry {
             Some(fs_entry) => reply.entry(&TTL, &get_attr(&fs_entry), 0),
             None => {

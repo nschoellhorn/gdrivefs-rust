@@ -11,7 +11,7 @@ table! {
         last_modified_at -> Timestamp,
         remote_type -> Nullable<RemoteTypeMapping>,
         inode -> BigInt,
-        parent_id -> Nullable<Text>,
         size -> BigInt,
+        parent_id -> Nullable<Text>,
     }
 }

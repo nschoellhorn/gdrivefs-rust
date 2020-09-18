@@ -41,14 +41,14 @@ async fn main() -> Result<()> {
     let repository = Arc::new(FilesystemRepository::new(connection));
     if let None = repository.find_inode_by_remote_id(test_drive.id.as_str()) {
         repository.create_entry(&FilesystemEntry {
-            inode: repository.get_largest_inode() + 1,
-            parent_inode: filesystem::SHARED_DRIVES_INODE as i64,
+            id: test_drive.id.clone(),
+            parent_id: Some("shared_drives".to_string()),
             name: test_drive.name.clone(),
             entry_type: EntryType::Directory,
             created_at: test_drive.created_time.naive_local(),
             last_modified_at: test_drive.created_time.naive_local(),
             remote_type: Some(RemoteType::TeamDrive),
-            remote_id: Some(test_drive.id.clone()),
+            inode: repository.get_largest_inode() + 1,
             size: 0,
         });
     }
@@ -192,9 +192,7 @@ fn process_create(file: File, indexing_repo: Arc<FilesystemRepository>) {
     if let None = indexing_repo.find_inode_by_remote_id(remote_id.as_str()) {
         indexing_repo.create_entry(&FilesystemEntry {
             inode: indexing_repo.get_largest_inode() + 1,
-            parent_inode: indexing_repo
-                .find_inode_by_remote_id(parent_id.as_str())
-                .expect(format!("Unable to find inode for remote id {}", parent_id.as_str()).as_str()),
+            parent_id: file.parents.first().map(|item| item.clone()),
             name: file.name,
             entry_type: match file.mime_type.as_str() {
                 "application/vnd.google-apps.folder" => EntryType::Directory,
@@ -206,7 +204,7 @@ fn process_create(file: File, indexing_repo: Arc<FilesystemRepository>) {
                 "application/vnd.google-apps.folder" => RemoteType::Directory,
                 _ => RemoteType::File,
             }),
-            remote_id: Some(remote_id),
+            id: remote_id,
             size: file
                 .size
                 .unwrap_or("0".to_string())

@@ -368,7 +368,7 @@ checksum = "3dcaa9ae7725d12cdb85b3ad99a434db70b468c09ded17e012d86b5c1010f7a7"
 [[package]]
 name = "fuse"
 version = "0.4.0-dev"
-source = "git+https://github.com/zargony/fuse-rs/?branch=master#1b1a51b20be7ab649b0fefc7e2c649d61fe510d8"
+source = "git+https://github.com/zargony/fuse-rs/#1b1a51b20be7ab649b0fefc7e2c649d61fe510d8"
 dependencies = [
  "fuse-abi",
  "fuse-sys",
@@ -380,12 +380,12 @@ dependencies = [
 [[package]]
 name = "fuse-abi"
 version = "0.4.0-dev"
-source = "git+https://github.com/zargony/fuse-rs/?branch=master#1b1a51b20be7ab649b0fefc7e2c649d61fe510d8"
+source = "git+https://github.com/zargony/fuse-rs/#1b1a51b20be7ab649b0fefc7e2c649d61fe510d8"
 
 [[package]]
 name = "fuse-sys"
 version = "0.4.0-dev"
-source = "git+https://github.com/zargony/fuse-rs/?branch=master#1b1a51b20be7ab649b0fefc7e2c649d61fe510d8"
+source = "git+https://github.com/zargony/fuse-rs/#1b1a51b20be7ab649b0fefc7e2c649d61fe510d8"
 dependencies = [
  "pkg-config",
 ]

@@ -99,8 +99,8 @@ impl FilesystemRepository {
         let real_str = entry_name.to_str().unwrap();
 
         diesel::sql_query("SELECT * FROM filesystem AS fs_parent JOIN filesystem AS fs_root ON (fs_root.parent_id = fs_parent.id) WHERE fs_parent=?")
-            .bind::<diesel::sql_types::Integer, _>(parent_i)
-            .get_results::<FilesystemEntry>(&self.connection)
+            .bind::<diesel::sql_types::BigInt, _>(parent_i)
+            .load::<FilesystemEntry>(&*self.connection.lock().unwrap())
             .optional()
             .expect("Error searching filesystem entry")
             .map(|vec| vec.into_iter().nth(0))
@@ -110,20 +110,6 @@ impl FilesystemRepository {
     pub(crate) fn find_entry_for_inode(&self, i: u64) -> Option<FilesystemEntry> {
         filesystem
             .filter(inode.eq(i as i64))
-            .first::<FilesystemEntry>(&*self.connection.lock().unwrap())
-            .optional()
-            .expect("Error searching filesystem entry")
-    }
-
-    pub(crate) fn find_entry_by_name_and_parent_inode(
-        &self,
-        _name: &str,
-        _parent_inode: i64,
-    ) -> Option<FilesystemEntry> {
-        filesystem
-            .filter(name.eq(&_name))
-            .filter(parent_inode.eq(_parent_inode))
-            .limit(1)
             .first::<FilesystemEntry>(&*self.connection.lock().unwrap())
             .optional()
             .expect("Error searching filesystem entry")
@@ -156,7 +142,7 @@ impl FilesystemRepository {
 
     pub(crate) fn remove_entry_by_remote_id(&self, rid: &str) -> Result<()> {
         diesel::delete(filesystem::table)
-            .filter(remote_id.eq(rid))
+            .filter(id.eq(rid))
             .execute(&*self.connection.lock().unwrap())?;
 
         Ok(())
