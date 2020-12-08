@@ -1,17 +1,17 @@
-use crate::database::schema::filesystem;
-use crate::database::schema::filesystem::dsl::*;
-use crate::filesystem as fs;
-
-use chrono::NaiveDateTime;
-use diesel::dsl::{exists, max};
-use diesel::{select, SqliteConnection};
-use diesel_derive_enum::DbEnum;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::sync::Mutex;
-use anyhow::Result;
 
+use anyhow::Result;
+use chrono::NaiveDateTime;
+use diesel::{select, SqliteConnection};
+use diesel::dsl::{exists, max};
 use diesel::prelude::*;
+use diesel_derive_enum::DbEnum;
+
+use crate::database::schema::filesystem;
+use crate::database::schema::filesystem::dsl::*;
+use crate::filesystem as fs;
 
 mod schema;
 
@@ -89,6 +89,19 @@ impl FilesystemRepository {
             .expect("Unable to load cached remote inode mapping")
             .into_iter()
             .collect()
+    }
+
+    pub(crate) fn find_parent_inode(&self, child_i: i64) -> Option<i64> {
+        diesel::sql_query("select parent.inode from filesystem as parent
+                                join filesystem as child on (child.parent_id = parent.id)
+                                where child.inode = ?")
+            .bind::<diesel::sql_types::BigInt, _>(child_i)
+            .load::<FilesystemEntry>(&*self.connection.lock().unwrap())
+            .optional()
+            .expect("Error searching filesystem entry")
+            .map(|vec| vec.into_iter().nth(0))
+            .flatten()
+            .map(|entry| entry.inode)
     }
 
     pub(crate) fn find_entry_as_child(
