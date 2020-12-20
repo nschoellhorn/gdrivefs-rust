@@ -186,7 +186,7 @@ fn process_delete(remote_id: String, indexing_repo: Arc<FilesystemRepository>) {
 }
 
 fn process_create(file: File, indexing_repo: Arc<FilesystemRepository>) {
-    let parent_id = file.parents.first().unwrap();
+
     let remote_id = file.id;
 
     if let None = indexing_repo.find_inode_by_remote_id(remote_id.as_str()) {

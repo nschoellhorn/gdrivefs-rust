@@ -129,9 +129,10 @@ impl FilesystemRepository {
     }
 
     pub(crate) fn find_all_entries_in_parent(&self, parent_i: u64) -> Vec<FilesystemEntry> {
-        filesystem
-            .filter(parent_inode.eq(parent_i as i64))
-            .order_by(inode)
+        diesel::sql_query("select * from filesystem as child
+                                join filesystem as parent on (child.parent_id = parent.id)
+                                where parent.inode = ?")
+            .bind::<diesel::sql_types::BigInt, _>(parent_i as i64)
             .load::<FilesystemEntry>(&*self.connection.lock().unwrap())
             .expect("Error searching filesystem entry")
     }
