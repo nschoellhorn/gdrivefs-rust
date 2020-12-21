@@ -4,9 +4,9 @@ use std::sync::Mutex;
 
 use anyhow::Result;
 use chrono::NaiveDateTime;
-use diesel::{select, SqliteConnection};
 use diesel::dsl::{exists, max};
 use diesel::prelude::*;
+use diesel::{select, SqliteConnection};
 use diesel_derive_enum::DbEnum;
 
 use crate::database::schema::filesystem;
@@ -92,16 +92,18 @@ impl FilesystemRepository {
     }
 
     pub(crate) fn find_parent_inode(&self, child_i: i64) -> Option<i64> {
-        diesel::sql_query("select parent.inode from filesystem as parent
+        diesel::sql_query(
+            "select parent.inode from filesystem as parent
                                 join filesystem as child on (child.parent_id = parent.id)
-                                where child.inode = ?")
-            .bind::<diesel::sql_types::BigInt, _>(child_i)
-            .load::<FilesystemEntry>(&*self.connection.lock().unwrap())
-            .optional()
-            .expect("Error searching filesystem entry")
-            .map(|vec| vec.into_iter().nth(0))
-            .flatten()
-            .map(|entry| entry.inode)
+                                where child.inode = ?",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(child_i)
+        .load::<FilesystemEntry>(&*self.connection.lock().unwrap())
+        .optional()
+        .expect("Error searching filesystem entry")
+        .map(|vec| vec.into_iter().nth(0))
+        .flatten()
+        .map(|entry| entry.inode)
     }
 
     pub(crate) fn find_entry_as_child(
@@ -129,12 +131,14 @@ impl FilesystemRepository {
     }
 
     pub(crate) fn find_all_entries_in_parent(&self, parent_i: u64) -> Vec<FilesystemEntry> {
-        diesel::sql_query("select * from filesystem as child
+        diesel::sql_query(
+            "select * from filesystem as child
                                 join filesystem as parent on (child.parent_id = parent.id)
-                                where parent.inode = ?")
-            .bind::<diesel::sql_types::BigInt, _>(parent_i as i64)
-            .load::<FilesystemEntry>(&*self.connection.lock().unwrap())
-            .expect("Error searching filesystem entry")
+                                where parent.inode = ?",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(parent_i as i64)
+        .load::<FilesystemEntry>(&*self.connection.lock().unwrap())
+        .expect("Error searching filesystem entry")
     }
 
     pub(crate) fn inode_exists(&self, i: u64) -> bool {

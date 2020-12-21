@@ -16,7 +16,7 @@ use crate::filesystem::GdriveFs;
 use anyhow::Result;
 use diesel::prelude::*;
 use std::io::prelude::*;
-use std::io::stdin;
+use std::io::{stdin, SeekFrom};
 use std::sync::Arc;
 
 lazy_static! {
@@ -27,9 +27,7 @@ lazy_static! {
 async fn main() -> Result<()> {
     simple_logger::init_with_level(log::Level::Info).unwrap();
 
-    let blocking_client = tokio::task::spawn_blocking(|| {
-        reqwest::blocking::Client::new()
-    }).await?;
+    let blocking_client = tokio::task::spawn_blocking(|| reqwest::blocking::Client::new()).await?;
 
     let drive_client = Arc::new(DriveClient::create(*CREDENTIALS_PATH, blocking_client).await?);
     let mut drives = drive_client.get_drives().await?;
@@ -65,7 +63,10 @@ async fn main() -> Result<()> {
     let mut current_token = String::new();
     state_file.read_to_string(&mut current_token)?;
 
-    state_file.seek(std::io::SeekFrom::Start(0))?;
+    state_file = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open("state.txt")?;
 
     current_token = current_token.trim().to_string();
 
@@ -75,81 +76,72 @@ async fn main() -> Result<()> {
 
     println!("Starting with page token {}", &current_token);
 
-    async_scoped::scope_and_block(|scope| {
-        let mut has_more = true;
-        let repo_ref = &repository;
-        let drive_id = test_drive.id.as_str();
-        while has_more {
-            let current_token_str = current_token.as_str();
-            let (_, mut change_list) = async_scoped::scope_and_block(|inner_scope| {
-                let drive_client = Arc::clone(&drive_client);
-                inner_scope.spawn(async move {
-                    let result = drive_client
-                        .get_change_list(current_token_str, drive_id)
-                        .await;
+    let mut has_more = true;
+    let repo_ref = &repository;
+    let drive_id = test_drive.id.as_str();
+    while has_more {
+        let current_token_str = current_token.as_str();
 
-                    if let Err(error) = result {
-                        println!("Got error while fetching changes");
-                        dbg!(error);
-                        return ChangeList {
-                            next_page_token: None,
-                            new_start_page_token: None,
-                            changes: vec![],
-                        };
-                    }
+        let result = drive_client
+            .get_change_list(current_token_str, drive_id)
+            .await;
 
-                    result.unwrap()
-                });
-            });
-            let change_list = change_list.remove(0);
-            let changes = change_list.changes;
+        let mut change_list = if let Err(error) = result {
+            println!("Got error while fetching changes");
+            dbg!(error);
+            ChangeList {
+                next_page_token: None,
+                new_start_page_token: None,
+                changes: vec![],
+            }
+        } else {
+            result.unwrap()
+        };
 
-            scope.spawn(async move {
-                let mut changes = changes
+        let changes = change_list.changes;
+
+        let mut changes = changes
                     .into_iter()
                     .filter(|change| change.r#type == "file")
                     .collect::<Vec<_>>();
-                changes.sort_by(|a, b| {
-                    let datetime_a = match a.file {
-                        Some(ref f) => f.created_time,
-                        None => a.time,
-                    };
+        changes.sort_by(|a, b| {
+            let datetime_a = match a.file {
+                Some(ref f) => f.created_time,
+                None => a.time,
+            };
 
-                    let datetime_b = match b.file {
-                        Some(ref f) => f.created_time,
-                        None => b.time,
-                    };
+            let datetime_b = match b.file {
+                Some(ref f) => f.created_time,
+                None => b.time,
+            };
 
-                    datetime_a.cmp(&datetime_b)
-                });
+            datetime_a.cmp(&datetime_b)
+        });
 
-                changes
-                    .into_iter()
-                    .for_each(|change| process_change(change, Arc::clone(repo_ref)))
-            });
+        changes
+            .into_iter()
+            .for_each(|change| process_change(change, Arc::clone(repo_ref)));
 
-            has_more = change_list.next_page_token.is_some();
-            if has_more {
-                current_token = change_list.next_page_token.unwrap();
-                state_file
-                    .write_all(current_token.as_bytes())
-                    .expect("Unable to write new state to file");
-            } else {
-                state_file
-                    .write_all(
-                        change_list
-                            .new_start_page_token
-                            .expect(
-                                "Next Start Page Token Not Found, this seems like an logic bug.",
-                            )
-                            .as_bytes(),
-                    )
-                    .expect("Unable to write new state to file");
-            }
-
-            state_file.flush().expect("Unable to flush state file");
+        has_more = change_list.next_page_token.is_some();
+        if has_more {
+            current_token = change_list.next_page_token.unwrap();
+            state_file
+                .write_all(current_token.as_bytes())
+                .expect("Unable to write new state to file");
+        } else {
+            state_file
+                .write_all(
+                    change_list
+                        .new_start_page_token
+                        .expect("Next Start Page Token Not Found, this seems like an logic bug.")
+                        .as_bytes(),
+                )
+                .expect("Unable to write new state to file");
         }
-    });
+
+        state_file.flush().expect("Unable to flush state file");
+        state_file.seek(SeekFrom::Start(0)).expect("Failed to reset write pointer to start of file.");
+    }
 
     println!("Finished indexing, mounting file system.");
 
@@ -186,7 +178,6 @@ fn process_delete(remote_id: String, indexing_repo: Arc<FilesystemRepository>) {
 }
 
 fn process_create(file: File, indexing_repo: Arc<FilesystemRepository>) {
-
     let remote_id = file.id;
 
     if let None = indexing_repo.find_inode_by_remote_id(remote_id.as_str()) {

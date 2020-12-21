@@ -157,9 +157,7 @@ impl Filesystem for GdriveFs {
 
         println!(
             "READ CALLED - Offset: {}, Size: {}, Inode: {}",
-            _offset,
-            _size,
-            _ino
+            _offset, _size, _ino
         );
         let client = Arc::clone(&self.drive_client);
         let data = client
@@ -173,9 +171,7 @@ impl Filesystem for GdriveFs {
         use std::borrow::Borrow;
         println!(
             "Replying with some data for this request :: Offset: {}, Size: {}, Inode: {}",
-            _offset,
-            _size,
-            _ino
+            _offset, _size, _ino
         );
         println!("Our reply is {} long", data.len());
         reply.data(data.borrow());
