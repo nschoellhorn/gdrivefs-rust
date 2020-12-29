@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use chrono::NaiveDateTime;
 use diesel::dsl::{exists, max};
 use diesel::prelude::*;
+use diesel::r2d2::{ConnectionManager, Pool};
 use diesel::{select, SqliteConnection};
 use diesel_derive_enum::DbEnum;
 
@@ -13,6 +14,7 @@ use crate::database::schema::filesystem;
 use crate::database::schema::filesystem::dsl::*;
 use crate::filesystem as fs;
 
+pub(crate) mod connection;
 mod schema;
 
 #[derive(Debug, DbEnum, Hash, Eq, PartialEq)]
@@ -43,30 +45,37 @@ pub struct FilesystemEntry {
 }
 
 pub struct FilesystemRepository {
-    connection: Mutex<SqliteConnection>,
+    connection: Pool<ConnectionManager<SqliteConnection>>,
 }
 
 impl FilesystemRepository {
-    pub(crate) fn new(connection: SqliteConnection) -> Self {
-        Self {
-            connection: Mutex::new(connection),
-        }
+    pub(crate) fn new(pool: Pool<ConnectionManager<SqliteConnection>>) -> Self {
+        Self { connection: pool }
     }
 
     pub(crate) fn get_largest_inode(&self) -> i64 {
         let largest_inode: Option<i64> = filesystem
             .select(max(inode))
-            .first(&*self.connection.lock().unwrap())
+            .first(&self.connection.get().unwrap())
             .unwrap();
 
         largest_inode.unwrap_or(0)
+    }
+
+    pub(crate) fn transaction<T, E, F>(&self, f: F) -> Result<T, E>
+    where
+        F: FnOnce() -> Result<T, E>,
+        E: From<diesel::result::Error>,
+    {
+        let connection = self.connection.get().unwrap();
+        connection.transaction(f)
     }
 
     pub(crate) fn find_parent_id(&self, i: String) -> Option<String> {
         filesystem
             .select(parent_id)
             .filter(id.eq(i))
-            .first::<Option<String>>(&*self.connection.lock().unwrap())
+            .first::<Option<String>>(&self.connection.get().unwrap())
             .optional()
             .expect("Unable to search for parent inode")
             .flatten()
@@ -77,7 +86,7 @@ impl FilesystemRepository {
             .select(inode)
             .filter(id.eq(rid))
             .limit(1)
-            .first::<i64>(&*self.connection.lock().unwrap())
+            .first::<i64>(&self.connection.get().unwrap())
             .optional()
             .expect("Error searching filesystem entry")
     }
@@ -85,7 +94,7 @@ impl FilesystemRepository {
     pub(crate) fn get_remote_inode_mapping(&self) -> HashMap<String, i64> {
         filesystem
             .select((id, inode))
-            .load::<(String, i64)>(&*self.connection.lock().unwrap())
+            .load::<(String, i64)>(&self.connection.get().unwrap())
             .expect("Unable to load cached remote inode mapping")
             .into_iter()
             .collect()
@@ -98,7 +107,7 @@ impl FilesystemRepository {
                                 where child.inode = ?",
         )
         .bind::<diesel::sql_types::BigInt, _>(child_i)
-        .load::<FilesystemEntry>(&*self.connection.lock().unwrap())
+        .load::<FilesystemEntry>(&self.connection.get().unwrap())
         .optional()
         .expect("Error searching filesystem entry")
         .map(|vec| vec.into_iter().nth(0))
@@ -113,9 +122,10 @@ impl FilesystemRepository {
     ) -> Option<FilesystemEntry> {
         let real_str = entry_name.to_str().unwrap();
 
-        diesel::sql_query("SELECT * FROM filesystem AS fs_parent JOIN filesystem AS fs_root ON (fs_root.parent_id = fs_parent.id) WHERE fs_parent=?")
+        diesel::sql_query("SELECT * FROM filesystem AS fs_parent JOIN filesystem AS fs_root ON (fs_root.parent_id = fs_parent.id) WHERE fs_parent.id=? AND fs_root.name=?")
             .bind::<diesel::sql_types::BigInt, _>(parent_i)
-            .load::<FilesystemEntry>(&*self.connection.lock().unwrap())
+            .bind::<diesel::sql_types::Text, _>(real_str)
+            .load::<FilesystemEntry>(&self.connection.get().unwrap())
             .optional()
             .expect("Error searching filesystem entry")
             .map(|vec| vec.into_iter().nth(0))
@@ -125,7 +135,7 @@ impl FilesystemRepository {
     pub(crate) fn find_entry_for_inode(&self, i: u64) -> Option<FilesystemEntry> {
         filesystem
             .filter(inode.eq(i as i64))
-            .first::<FilesystemEntry>(&*self.connection.lock().unwrap())
+            .first::<FilesystemEntry>(&self.connection.get().unwrap())
             .optional()
             .expect("Error searching filesystem entry")
     }
@@ -137,7 +147,7 @@ impl FilesystemRepository {
                                 where parent.inode = ?",
         )
         .bind::<diesel::sql_types::BigInt, _>(parent_i as i64)
-        .load::<FilesystemEntry>(&*self.connection.lock().unwrap())
+        .load::<FilesystemEntry>(&self.connection.get().unwrap())
         .expect("Error searching filesystem entry")
     }
 
@@ -147,21 +157,21 @@ impl FilesystemRepository {
         }
 
         select(exists(filesystem.filter(inode.eq(i as i64))))
-            .get_result(&*self.connection.lock().unwrap())
+            .get_result(&self.connection.get().unwrap())
             .expect("SQL Query went sideways.")
     }
 
     pub(crate) fn create_entry(&self, fs_entry: &FilesystemEntry) {
         diesel::insert_into(filesystem::table)
             .values(fs_entry)
-            .execute(&*self.connection.lock().unwrap())
+            .execute(&self.connection.get().unwrap())
             .expect("Unable to insert new entry");
     }
 
     pub(crate) fn remove_entry_by_remote_id(&self, rid: &str) -> Result<()> {
         diesel::delete(filesystem::table)
             .filter(id.eq(rid))
-            .execute(&*self.connection.lock().unwrap())?;
+            .execute(&self.connection.get().unwrap())?;
 
         Ok(())
     }

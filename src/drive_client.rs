@@ -56,6 +56,7 @@ pub struct ChangeList {
 pub struct File {
     pub id: String,
     pub name: String,
+    #[serde(default = "Vec::new")]
     pub parents: Vec<String>,
     pub created_time: DateTime<Utc>,
     pub modified_time: DateTime<Utc>,
@@ -127,8 +128,6 @@ impl DriveClient {
 
     async fn get_authenticated(&self, url: &str) -> Result<RequestBuilder> {
         let token = self.get_token().await?;
-        //dbg!(&token);
-        println!("Got Token");
         Ok(self
             .http_client
             .get(format!("{}{}", *GDRIVE_BASE_URL, url).as_str())
@@ -172,7 +171,7 @@ impl DriveClient {
                     ("supportsAllDrives", "true"),
                     ("driveId", drive_id),
                     ("fields", "nextPageToken, newStartPageToken, changes(type, changeType, time, removed, fileId, file(id, name, mimeType, parents, createdTime, modifiedTime, size))"),
-                    ("pageSize", "1000"),
+                    ("pageSize", "512"),
                 ]).send().await;
 
         if response.is_err() {
@@ -182,8 +181,6 @@ impl DriveClient {
         }
 
         let response = response.unwrap();
-
-        dbg!(&response);
 
         if !response.status().is_success() {
             dbg!(response.text().await?);
