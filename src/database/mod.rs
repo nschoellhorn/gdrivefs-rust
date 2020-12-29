@@ -102,7 +102,7 @@ impl FilesystemRepository {
 
     pub(crate) fn find_parent_inode(&self, child_i: i64) -> Option<i64> {
         diesel::sql_query(
-            "select parent.inode from filesystem as parent
+            "select parent.* from filesystem as parent
                                 join filesystem as child on (child.parent_id = parent.id)
                                 where child.inode = ?",
         )
@@ -122,7 +122,7 @@ impl FilesystemRepository {
     ) -> Option<FilesystemEntry> {
         let real_str = entry_name.to_str().unwrap();
 
-        diesel::sql_query("SELECT * FROM filesystem AS fs_parent JOIN filesystem AS fs_root ON (fs_root.parent_id = fs_parent.id) WHERE fs_parent.id=? AND fs_root.name=?")
+        diesel::sql_query("SELECT fs_root.* FROM filesystem AS fs_parent JOIN filesystem AS fs_root ON (fs_root.parent_id = fs_parent.id) WHERE fs_parent.inode=? AND fs_root.name=?")
             .bind::<diesel::sql_types::BigInt, _>(parent_i)
             .bind::<diesel::sql_types::Text, _>(real_str)
             .load::<FilesystemEntry>(&self.connection.get().unwrap())
@@ -142,7 +142,7 @@ impl FilesystemRepository {
 
     pub(crate) fn find_all_entries_in_parent(&self, parent_i: u64) -> Vec<FilesystemEntry> {
         diesel::sql_query(
-            "select * from filesystem as child
+            "select child.* from filesystem as child
                                 join filesystem as parent on (child.parent_id = parent.id)
                                 where parent.inode = ?",
         )
