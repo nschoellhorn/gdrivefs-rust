@@ -132,7 +132,7 @@ impl Filesystem for GdriveFs {
             return;
         }
 
-        let file_handle = self.make_file_handle(fs_entry.unwrap().remote_id.unwrap());
+        let file_handle = self.make_file_handle(fs_entry.unwrap().id);
         reply.opened(file_handle, _flags);
     }
 
@@ -157,9 +157,7 @@ impl Filesystem for GdriveFs {
 
         println!(
             "READ CALLED - Offset: {}, Size: {}, Inode: {}",
-            _offset,
-            _size,
-            _ino
+            _offset, _size, _ino
         );
         let client = Arc::clone(&self.drive_client);
         let data = client
@@ -173,9 +171,7 @@ impl Filesystem for GdriveFs {
         use std::borrow::Borrow;
         println!(
             "Replying with some data for this request :: Offset: {}, Size: {}, Inode: {}",
-            _offset,
-            _size,
-            _ino
+            _offset, _size, _ino
         );
         println!("Our reply is {} long", data.len());
         reply.data(data.borrow());
@@ -188,22 +184,35 @@ impl Filesystem for GdriveFs {
         entry_name: &OsStr,
         reply: ReplyEntry,
     ) {
+        if entry_name.to_str().unwrap().starts_with("P18009") {
+            println!("Start lookup Payment Clarity");
+        }
+
         // We need to look up top level directories, which are the drives in our case
         let entry = self
             .repository
-            .find_entry_as_child(parent_inode, entry_name);
+            .find_entry_as_child(parent_inode as i64, entry_name);
         match entry {
-            Some(fs_entry) => reply.entry(&TTL, &get_attr(&fs_entry), 0),
+            Some(fs_entry) => {
+                if entry_name.to_str().unwrap().starts_with("P18009") {
+                    println!("Lookup for Payment Clarity");
+                    dbg!(get_attr(&fs_entry));
+                }
+
+                reply.entry(&TTL, &get_attr(&fs_entry), 0)
+            },
             None => {
-                /*println!(
-                    r#"
-                    Call Errored: lookup()
-                    Request: {:?}
-                    Inode: {}
-                    Entry Name: {:?}
-                    "#,
-                    request, parent_inode, entry_name
-                );*/
+                if !entry_name.to_str().unwrap().starts_with("._") {
+                    println!(
+                        r#"
+                        Call Errored: lookup()
+                        Request: {:?}
+                        Inode: {}
+                        Entry Name: {:?}
+                        "#,
+                        request, parent_inode, entry_name
+                    );
+                }
 
                 reply.error(ENOENT)
             }
@@ -253,34 +262,41 @@ impl Filesystem for GdriveFs {
         mut reply: ReplyDirectory,
     ) {
         let inode_exists = self.repository.inode_exists(inode);
-        if inode_exists {
-            if offset < 1 {
-                reply.add(inode, 1, FileType::Directory, ".");
-            }
-
-            if offset < 2 {
-                let parent_inode =
-                    self.repository.find_parent_inode(inode as i64).unwrap_or(1) as u64;
-                reply.add(parent_inode, 2, FileType::Directory, "..");
-            }
-        }
 
         let results = self.repository.find_all_entries_in_parent(inode);
 
-        results
+        let iterator = results
             .iter()
-            .enumerate()
-            .skip(offset as usize)
-            .for_each(|(offset, entry)| {
-                reply.add(
-                    entry.inode as u64,
-                    (offset + 2) as i64,
-                    GdriveFs::to_file_type(&entry.entry_type),
-                    entry.name.clone(),
-                );
-            });
+            .skip(offset as usize);
+
+        let mut current_offset = offset + 1;
+        for entry in iterator {
+            println!("Adding entry {:?}", &entry.name);
+            let result = reply.add(
+                entry.inode as u64,
+                current_offset,
+                GdriveFs::to_file_type(&entry.entry_type),
+                entry.name.clone(),
+            );
+
+            if result {
+                break;
+            }
+
+            current_offset += 1;
+        }
 
         if inode_exists {
+            /*println!(
+                r#"
+                Call Succeeded: readdir()
+                Request: {:?}
+                Inode: {}
+                File Handle: {}
+                Offset: {}
+                "#,
+                request, inode, file_handle, offset
+            );*/
             reply.ok();
         } else {
             println!(

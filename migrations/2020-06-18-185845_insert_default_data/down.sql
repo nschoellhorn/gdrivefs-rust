@@ -1,1 +1,0 @@
-DELETE FROM filesystem WHERE name = 'Eigene Ablagen' OR name = 'Geteilte Ablagen';

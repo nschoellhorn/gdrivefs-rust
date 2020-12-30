@@ -4,12 +4,12 @@ use futures::future::{FutureExt, LocalBoxFuture};
 use hyper::client::HttpConnector;
 use hyper_rustls::HttpsConnector;
 use reqwest::{header, Client, RequestBuilder};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::{Arc, Mutex};
 use yup_oauth2::authenticator::Authenticator;
 use yup_oauth2::{InstalledFlowAuthenticator, InstalledFlowReturnMethod};
-use std::cell::Cell;
-use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
@@ -56,6 +56,7 @@ pub struct ChangeList {
 pub struct File {
     pub id: String,
     pub name: String,
+    #[serde(default = "Vec::new")]
     pub parents: Vec<String>,
     pub created_time: DateTime<Utc>,
     pub modified_time: DateTime<Utc>,
@@ -87,7 +88,10 @@ pub struct DriveClient {
 }
 
 impl DriveClient {
-    pub async fn create(credentials_path: &str, blocking_client: reqwest::blocking::Client) -> Result<Self> {
+    pub async fn create(
+        credentials_path: &str,
+        blocking_client: reqwest::blocking::Client,
+    ) -> Result<Self> {
         // Read the application secret
         let secret = yup_oauth2::read_application_secret(credentials_path)
             .await
@@ -124,8 +128,6 @@ impl DriveClient {
 
     async fn get_authenticated(&self, url: &str) -> Result<RequestBuilder> {
         let token = self.get_token().await?;
-        //dbg!(&token);
-        println!("Got Token");
         Ok(self
             .http_client
             .get(format!("{}{}", *GDRIVE_BASE_URL, url).as_str())
@@ -169,7 +171,7 @@ impl DriveClient {
                     ("supportsAllDrives", "true"),
                     ("driveId", drive_id),
                     ("fields", "nextPageToken, newStartPageToken, changes(type, changeType, time, removed, fileId, file(id, name, mimeType, parents, createdTime, modifiedTime, size))"),
-                    ("pageSize", "1000"),
+                    ("pageSize", "512"),
                 ]).send().await;
 
         if response.is_err() {
@@ -179,8 +181,6 @@ impl DriveClient {
         }
 
         let response = response.unwrap();
-
-        dbg!(&response);
 
         if !response.status().is_success() {
             dbg!(response.text().await?);
@@ -196,8 +196,8 @@ impl DriveClient {
         byte_from: u64,
         byte_to: u64,
     ) -> Result<bytes::Bytes> {
-        let mut request = self
-            .get_authenticated_blocking(format!("/files/{}", file_id).as_str())?;
+        let mut request =
+            self.get_authenticated_blocking(format!("/files/{}", file_id).as_str())?;
         let params = vec![
             ("alt".to_string(), "media".to_string()),
             ("supportsAllDrives".to_string(), "true".to_string()),

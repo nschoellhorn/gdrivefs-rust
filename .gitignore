@@ -2,6 +2,6 @@
 .idea/
 clientCredentials.json
 tokencache.json
-filesystem.db
+filesystem.db*
 .vscode/
 state.txt
