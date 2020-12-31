@@ -66,9 +66,6 @@ fn get_attr(entry: &FilesystemEntry) -> FileAttr {
 }
 
 const TTL: Duration = Duration::from_secs(1);
-pub(crate) const ROOT_INODE: u64 = 1;
-pub(crate) const OWN_DRIVES_INODE: u64 = 2;
-pub(crate) const SHARED_DRIVES_INODE: u64 = 3;
 
 pub(crate) struct GdriveFs {
     repository: Arc<FilesystemRepository>,

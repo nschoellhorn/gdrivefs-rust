@@ -13,6 +13,8 @@ use yup_oauth2::{InstalledFlowAuthenticator, InstalledFlowReturnMethod};
 
 use serde::{Deserialize, Serialize};
 
+use crate::FETCH_SIZE;
+
 lazy_static! {
     static ref SCOPES: [&'static str; 1] = ["https://www.googleapis.com/auth/drive",];
     static ref GDRIVE_BASE_URL: &'static str = "https://www.googleapis.com/drive/v3";
@@ -139,7 +141,7 @@ impl DriveClient {
         let token = lock.take();
         lock.set(token.clone());
 
-        //dbg!(&token);
+        dbg!(&token);
         println!("Got Token");
         Ok(self
             .blocking_client
@@ -171,7 +173,7 @@ impl DriveClient {
                     ("supportsAllDrives", "true"),
                     ("driveId", drive_id),
                     ("fields", "nextPageToken, newStartPageToken, changes(type, changeType, time, removed, fileId, file(id, name, mimeType, parents, createdTime, modifiedTime, size))"),
-                    ("pageSize", "512"),
+                    ("pageSize", &format!("{}", *FETCH_SIZE)),
                 ]).send().await;
 
         if response.is_err() {
