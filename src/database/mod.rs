@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use chrono::NaiveDateTime;
@@ -12,7 +11,6 @@ use diesel_derive_enum::DbEnum;
 
 use crate::database::schema::filesystem;
 use crate::database::schema::filesystem::dsl::*;
-use crate::filesystem as fs;
 
 pub(crate) mod connection;
 mod schema;
@@ -42,6 +40,7 @@ pub struct FilesystemEntry {
     pub inode: i64,
     pub size: i64,
     pub parent_id: Option<String>,
+    pub parent_inode: Option<i64>,
 }
 
 pub struct FilesystemRepository {
@@ -122,7 +121,7 @@ impl FilesystemRepository {
     ) -> Option<FilesystemEntry> {
         let real_str = entry_name.to_str().unwrap();
 
-        diesel::sql_query("SELECT fs_root.* FROM filesystem AS fs_parent JOIN filesystem AS fs_root ON (fs_root.parent_id = fs_parent.id) WHERE fs_parent.inode=? AND fs_root.name=?")
+        diesel::sql_query("SELECT * FROM filesystem WHERE parent_inode = ? AND name = ?")
             .bind::<diesel::sql_types::BigInt, _>(parent_i)
             .bind::<diesel::sql_types::Text, _>(real_str)
             .load::<FilesystemEntry>(&self.connection.get().unwrap())
@@ -143,8 +142,7 @@ impl FilesystemRepository {
     pub(crate) fn find_all_entries_in_parent(&self, parent_i: u64) -> Vec<FilesystemEntry> {
         diesel::sql_query(
             "select child.* from filesystem as child
-                                join filesystem as parent on (child.parent_id = parent.id)
-                                where parent.inode = ?",
+                                where child.parent_inode = ?",
         )
         .bind::<diesel::sql_types::BigInt, _>(parent_i as i64)
         .load::<FilesystemEntry>(&self.connection.get().unwrap())
@@ -152,10 +150,6 @@ impl FilesystemRepository {
     }
 
     pub(crate) fn inode_exists(&self, i: u64) -> bool {
-        if i == fs::ROOT_INODE {
-            return true;
-        }
-
         select(exists(filesystem.filter(inode.eq(i as i64))))
             .get_result(&self.connection.get().unwrap())
             .expect("SQL Query went sideways.")
@@ -166,6 +160,17 @@ impl FilesystemRepository {
             .values(fs_entry)
             .execute(&self.connection.get().unwrap())
             .expect("Unable to insert new entry");
+    }
+
+    pub(crate) fn set_parent_inode_by_parent_id(&self, p_id: &str, p_inode: i64) -> Result<usize> {
+        let target = filesystem::table
+            .filter(parent_id.eq(p_id))
+            .filter(parent_inode.is_null());
+        let affected_rows = diesel::update(target)
+            .set(parent_inode.eq(p_inode))
+            .execute(&self.connection.get().unwrap())?;
+
+        Ok(affected_rows)
     }
 
     pub(crate) fn remove_entry_by_remote_id(&self, rid: &str) -> Result<()> {

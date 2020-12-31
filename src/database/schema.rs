@@ -13,5 +13,6 @@ table! {
         inode -> BigInt,
         size -> BigInt,
         parent_id -> Nullable<Text>,
+        parent_inode -> Nullable<BigInt>,
     }
 }

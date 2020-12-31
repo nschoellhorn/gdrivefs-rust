@@ -5,8 +5,9 @@ CREATE TABLE filesystem (
     created_at INTEGER NOT NULL,
     last_modified_at INTEGER NOT NULL,
     remote_type VARCHAR CHECK(remote_type IN ('team_drive', 'directory', 'file')),
-    inode INTEGER,
+    inode INTEGER NOT NULL,
     parent_id VARCHAR NULL,
+    parent_inode INTEGER NULL,
 
     FOREIGN KEY(parent_id) REFERENCES filesystem(id)
 );

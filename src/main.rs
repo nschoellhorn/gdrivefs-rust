@@ -12,10 +12,9 @@ mod filesystem;
 mod indexing;
 
 use crate::database::{EntryType, FilesystemEntry, FilesystemRepository, RemoteType};
-use crate::drive_client::{Change, ChangeList, DriveClient, File};
+use crate::drive_client::{ChangeList, DriveClient};
 use crate::filesystem::GdriveFs;
 use anyhow::Result;
-use diesel::prelude::*;
 use indexing::IndexWriter;
 use std::io::prelude::*;
 use std::io::{stdin, SeekFrom};
@@ -24,6 +23,8 @@ use std::sync::Arc;
 lazy_static! {
     static ref CREDENTIALS_PATH: &'static str = "clientCredentials.json";
     static ref BATCH_SIZE: usize = 512;
+    static ref FETCH_SIZE: usize = 512;
+    static ref BUFFER_SIZE: usize = 2048;
 }
 
 #[tokio::main]
@@ -38,9 +39,9 @@ async fn main() -> Result<()> {
 
     dbg!(&test_drive);
 
-    let connection_manager = diesel::r2d2::ConnectionManager::new("filesystem.db");
+    let connection_manager = diesel::r2d2::ConnectionManager::new("/Users/nschoellhorn/IdeaProjects/gdrivefs-rust/filesystem.db");
     let connection_pool = diesel::r2d2::Pool::builder()
-        .max_size(4)
+        .max_size(10)
         .connection_customizer(Box::new(database::connection::ConnectionOptions {
             enable_wal: true,
             enable_foreign_keys: false,
@@ -49,8 +50,8 @@ async fn main() -> Result<()> {
         .build(connection_manager)
         .expect("Failed to create connection pool");
     let repository = Arc::new(FilesystemRepository::new(connection_pool.clone()));
-    create_root(&repository);
-    create_shared_drives(&repository);
+    let root_inode = create_root(&repository);
+    let shared_drives_inode = create_shared_drives(&repository, root_inode);
     if let None = repository.find_inode_by_remote_id(test_drive.id.as_str()) {
         repository.create_entry(&FilesystemEntry {
             id: test_drive.id.clone(),
@@ -62,17 +63,18 @@ async fn main() -> Result<()> {
             remote_type: Some(RemoteType::TeamDrive),
             inode: repository.get_largest_inode() + 1,
             size: 0,
+            parent_inode: Some(shared_drives_inode),
         });
     }
 
     let filesystem = GdriveFs::new(Arc::clone(&repository), Arc::clone(&drive_client));
 
-    println!("Indexing drive changes...");
+    log::info!("Starting indexing.");
     let mut state_file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .read(true)
-        .open("state.txt")?;
+        .open("/Users/nschoellhorn/IdeaProjects/gdrivefs-rust/state.txt")?;
 
     let mut current_token = String::new();
     state_file.read_to_string(&mut current_token)?;
@@ -80,7 +82,7 @@ async fn main() -> Result<()> {
     state_file = std::fs::OpenOptions::new()
         .write(true)
         .truncate(true)
-        .open("state.txt")?;
+        .open("/Users/nschoellhorn/IdeaProjects/gdrivefs-rust/state.txt")?;
 
     current_token = current_token.trim().to_string();
 
@@ -89,11 +91,7 @@ async fn main() -> Result<()> {
     }
 
     let indexing_worker = IndexWriter::new(connection_pool.clone());
-    println!("Before start");
     let (indexing_handle, mut publisher) = indexing_worker.launch();
-    println!("After start");
-
-    println!("Starting with page token {}", &current_token);
 
     let mut has_more = true;
     let drive_id = test_drive.id.as_str();
@@ -120,9 +118,7 @@ async fn main() -> Result<()> {
         let next_page_token = change_list.next_page_token.clone();
 
         for change in change_list.changes.into_iter() {
-            println!("Sending");
             publisher.send(change).await?;
-            println!("Sent.");
         }
 
         has_more = next_page_token.is_some();
@@ -147,7 +143,7 @@ async fn main() -> Result<()> {
             .expect("Failed to reset write pointer to start of file.");
     }
 
-    println!("Finished indexing, mounting file system.");
+    log::info!("Indexing finished, mounting filesystem.");
 
     let handle = tokio::task::spawn_blocking(|| {
         fuse::mount(filesystem, "/Users/nschoellhorn/testfs", &[])
@@ -168,36 +164,50 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn create_root(repository: &FilesystemRepository) {
+fn create_root(repository: &FilesystemRepository) -> i64 {
     let date_time = chrono::Utc::now().naive_local();
-    if let None = repository.find_inode_by_remote_id("root") {
-        repository.create_entry(&FilesystemEntry {
-            id: "root".to_string(),
-            parent_id: None,
-            name: "Shared Drives".to_string(),
-            entry_type: EntryType::Directory,
-            created_at: date_time.clone(),
-            last_modified_at: date_time,
-            remote_type: Some(RemoteType::Directory),
-            inode: repository.get_largest_inode() + 1,
-            size: 0,
-        });
+    match repository.find_inode_by_remote_id("root") {
+        Some(inode) => inode,
+        None => {
+            let inode = repository.get_largest_inode() + 1;
+            repository.create_entry(&FilesystemEntry {
+                id: "root".to_string(),
+                parent_id: None,
+                name: "Shared Drives".to_string(),
+                entry_type: EntryType::Directory,
+                created_at: date_time.clone(),
+                last_modified_at: date_time,
+                remote_type: Some(RemoteType::Directory),
+                inode: inode,
+                size: 0,
+                parent_inode: None,
+            });
+
+            inode
+        }
     }
 }
 
-fn create_shared_drives(repository: &FilesystemRepository) {
+fn create_shared_drives(repository: &FilesystemRepository, root_inode: i64) -> i64 {
     let date_time = chrono::Utc::now().naive_local();
-    if let None = repository.find_inode_by_remote_id("shared_drives") {
-        repository.create_entry(&FilesystemEntry {
-            id: "shared_drives".to_string(),
-            parent_id: Some("root".to_string()),
-            name: "Shared Drives".to_string(),
-            entry_type: EntryType::Directory,
-            created_at: date_time,
-            last_modified_at: date_time,
-            remote_type: Some(RemoteType::Directory),
-            inode: repository.get_largest_inode() + 1,
-            size: 0,
-        });
+    match repository.find_inode_by_remote_id("shared_drives") {
+        Some(inode) => inode,
+        None => {
+            let inode = repository.get_largest_inode() + 1;
+            repository.create_entry(&FilesystemEntry {
+                id: "shared_drives".to_string(),
+                parent_id: Some("root".to_string()),
+                name: "Shared Drives".to_string(),
+                entry_type: EntryType::Directory,
+                created_at: date_time,
+                last_modified_at: date_time,
+                remote_type: Some(RemoteType::Directory),
+                inode: inode,
+                size: 0,
+                parent_inode: Some(root_inode),
+            });
+
+            inode
+        }
     }
 }

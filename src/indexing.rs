@@ -1,8 +1,8 @@
-use diesel::{SqliteConnection, joinable, r2d2::{ConnectionManager, Pool}};
-use tokio::{sync::mpsc::{Receiver, Sender}, task::{JoinError, JoinHandle}};
+use diesel::{SqliteConnection, r2d2::{ConnectionManager, Pool}};
+use tokio::{sync::mpsc::{Receiver, Sender}, task::JoinHandle};
 
 use crate::{database::{EntryType, FilesystemEntry, FilesystemRepository, RemoteType}, drive_client::{Change, ChangeList, File}};
-use crate::BATCH_SIZE;
+use crate::{BATCH_SIZE, BUFFER_SIZE};
 
 pub(crate) struct IndexWriter {
     publisher: Sender<Change>,
@@ -11,7 +11,7 @@ pub(crate) struct IndexWriter {
 
 impl IndexWriter {
     pub(crate) fn new(pool: Pool<ConnectionManager<SqliteConnection>>) -> Self {
-        let (tx, rx) = tokio::sync::mpsc::channel(2048);
+        let (tx, rx) = tokio::sync::mpsc::channel(*BUFFER_SIZE);
         IndexWriter {
             publisher: tx,
             worker: IndexWorker::new(rx, FilesystemRepository::new(pool)),
@@ -44,7 +44,6 @@ impl IndexWorker {
 
     async fn worker_loop(&mut self) {
         let mut batch = Vec::with_capacity(*BATCH_SIZE);
-        println!("Receiving");
         while let Some(change) = self.receiver.recv().await {
             batch.push(change);
 
@@ -85,11 +84,20 @@ impl IndexWorker {
             dbg!("Found empty parents for file: {}", &file);
         }
         let remote_id = file.id;
+        let parent_id = file.parents.first().map(|item| item.clone());
+
+        let parent_inode = if let Some(parent_remote) = parent_id.as_ref() {
+            self.repository.find_inode_by_remote_id(parent_remote.as_str())
+        } else {
+            None
+        };
 
         if let None = self.repository.find_inode_by_remote_id(remote_id.as_str()) {
+            // First, we create the new entry itself
+            let inode = self.repository.get_largest_inode() + 1;
             self.repository.create_entry(&FilesystemEntry {
-                inode: self.repository.get_largest_inode() + 1,
-                parent_id: file.parents.first().map(|item| item.clone()),
+                inode,
+                parent_id: parent_id,
                 name: file.name,
                 entry_type: match file.mime_type.as_str() {
                     "application/vnd.google-apps.folder" => EntryType::Directory,
@@ -101,14 +109,19 @@ impl IndexWorker {
                     "application/vnd.google-apps.folder" => RemoteType::Directory,
                     _ => RemoteType::File,
                 }),
-                id: remote_id,
+                id: remote_id.clone(),
                 size: file
                     .size
                     .unwrap_or("0".to_string())
                     .as_str()
                     .parse()
                     .unwrap_or(0),
-            })
+                parent_inode,
+            });
+
+            // but then, we also update all entries that have the current remote id as the parent remote
+            // to make sure they know about their parent inode as well
+            self.repository.set_parent_inode_by_parent_id(&remote_id, inode);
         }
     }
 }
