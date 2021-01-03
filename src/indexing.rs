@@ -80,9 +80,6 @@ impl IndexWorker {
     }
 
     fn process_create(&self, file: File) {
-        if file.parents.is_empty() {
-            dbg!("Found empty parents for file: {}", &file);
-        }
         let remote_id = file.id;
         let parent_id = file.parents.first().map(|item| item.clone());
 

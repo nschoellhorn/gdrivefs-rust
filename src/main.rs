@@ -6,19 +6,25 @@ extern crate lazy_static;
 #[macro_use]
 extern crate diesel;
 
+#[macro_use]
+extern crate diesel_migrations;
+
 mod database;
 mod drive_client;
 mod filesystem;
 mod indexing;
+mod config;
 
 use crate::database::{EntryType, FilesystemEntry, FilesystemRepository, RemoteType};
 use crate::drive_client::{ChangeList, DriveClient};
 use crate::filesystem::GdriveFs;
 use anyhow::Result;
 use indexing::IndexWriter;
-use std::io::prelude::*;
+use std::{io::prelude::*, path::Path};
 use std::io::{stdin, SeekFrom};
 use std::sync::Arc;
+use ::config::{File, Config};
+use diesel_migrations::run_pending_migrations;
 
 lazy_static! {
     static ref CREDENTIALS_PATH: &'static str = "clientCredentials.json";
@@ -27,17 +33,24 @@ lazy_static! {
     static ref BUFFER_SIZE: usize = 2048;
 }
 
+embed_migrations!("migrations/");
+
+async fn create_drive_client() -> Result<DriveClient> {
+    let blocking_client = tokio::task::spawn_blocking(|| reqwest::blocking::Client::new()).await?;
+    Ok(DriveClient::create(*CREDENTIALS_PATH, blocking_client).await?)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     simple_logger::init_with_level(log::Level::Info).unwrap();
 
-    let blocking_client = tokio::task::spawn_blocking(|| reqwest::blocking::Client::new()).await?;
+    let config_dir = dirs::config_dir().unwrap().join("StreamDrive");
 
-    let drive_client = Arc::new(DriveClient::create(*CREDENTIALS_PATH, blocking_client).await?);
-    let mut drives = drive_client.get_drives().await?;
-    let test_drive = drives.remove(1);
+    if !config_dir.exists() {
+        std::fs::create_dir(config_dir)?;
+    }
 
-    dbg!(&test_drive);
+    let drive_client = Arc::new(create_drive_client().await?);
 
     let connection_manager = diesel::r2d2::ConnectionManager::new("/Users/nschoellhorn/IdeaProjects/gdrivefs-rust/filesystem.db");
     let connection_pool = diesel::r2d2::Pool::builder()
@@ -49,9 +62,16 @@ async fn main() -> Result<()> {
         }))
         .build(connection_manager)
         .expect("Failed to create connection pool");
+
+    run_pending_migrations(&connection_pool.get().unwrap())?;
+
     let repository = Arc::new(FilesystemRepository::new(connection_pool.clone()));
     let root_inode = create_root(&repository);
     let shared_drives_inode = create_shared_drives(&repository, root_inode);
+
+    let mut drives = drive_client.get_drives().await?;
+    let test_drive = drives.remove(1);
+
     if let None = repository.find_inode_by_remote_id(test_drive.id.as_str()) {
         repository.create_entry(&FilesystemEntry {
             id: test_drive.id.clone(),
