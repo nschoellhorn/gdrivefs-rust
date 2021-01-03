@@ -20,7 +20,7 @@ use crate::drive_client::{ChangeList, DriveClient};
 use crate::filesystem::GdriveFs;
 use anyhow::Result;
 use indexing::IndexWriter;
-use std::{io::prelude::*, path::Path};
+use std::io::prelude::*;
 use std::io::{stdin, SeekFrom};
 use std::sync::Arc;
 use ::config::{File, Config};
@@ -28,9 +28,7 @@ use diesel_migrations::run_pending_migrations;
 
 lazy_static! {
     static ref CREDENTIALS_PATH: &'static str = "clientCredentials.json";
-    static ref BATCH_SIZE: usize = 512;
-    static ref FETCH_SIZE: usize = 512;
-    static ref BUFFER_SIZE: usize = 2048;
+    
 }
 
 embed_migrations!("migrations/");
@@ -68,6 +66,7 @@ async fn main() -> Result<()> {
     let repository = Arc::new(FilesystemRepository::new(connection_pool.clone()));
     let root_inode = create_root(&repository);
     let shared_drives_inode = create_shared_drives(&repository, root_inode);
+    let my_drives_inode = create_my_drives(&repository, root_inode);
 
     let mut drives = drive_client.get_drives().await?;
     let test_drive = drives.remove(1);
@@ -80,14 +79,20 @@ async fn main() -> Result<()> {
             entry_type: EntryType::Directory,
             created_at: test_drive.created_time.naive_local(),
             last_modified_at: test_drive.created_time.naive_local(),
-            remote_type: Some(RemoteType::TeamDrive),
+            remote_type: Some(RemoteType::Directory),
             inode: repository.get_largest_inode() + 1,
             size: 0,
-            parent_inode: Some(shared_drives_inode),
+            parent_inode: Some(shared_drives_inode as i64),
         });
     }
 
-    let filesystem = GdriveFs::new(Arc::clone(&repository), Arc::clone(&drive_client));
+    let filesystem = GdriveFs::new(
+        Arc::clone(&repository),
+         Arc::clone(&drive_client),
+         root_inode,
+         shared_drives_inode,
+         my_drives_inode
+    );
 
     log::info!("Starting indexing.");
     let mut state_file = std::fs::OpenOptions::new()
@@ -179,39 +184,39 @@ async fn main() -> Result<()> {
     command.spawn().unwrap().wait().expect("Filesystem wasn't unmounted successfully, try running this yourself: fusermount -u /home/nschoellhorn/testfs");
 
     handle.await?;
-    indexing_handle.await;
+    indexing_handle.await?;
 
     Ok(())
 }
 
-fn create_root(repository: &FilesystemRepository) -> i64 {
+fn create_root(repository: &FilesystemRepository) -> u64 {
     let date_time = chrono::Utc::now().naive_local();
     match repository.find_inode_by_remote_id("root") {
-        Some(inode) => inode,
+        Some(inode) => inode as u64,
         None => {
             let inode = repository.get_largest_inode() + 1;
             repository.create_entry(&FilesystemEntry {
                 id: "root".to_string(),
                 parent_id: None,
-                name: "Shared Drives".to_string(),
+                name: "StreamDrive".to_string(),
                 entry_type: EntryType::Directory,
                 created_at: date_time.clone(),
                 last_modified_at: date_time,
                 remote_type: Some(RemoteType::Directory),
-                inode: inode,
+                inode,
                 size: 0,
                 parent_inode: None,
             });
 
-            inode
+            inode as u64
         }
     }
 }
 
-fn create_shared_drives(repository: &FilesystemRepository, root_inode: i64) -> i64 {
+fn create_shared_drives(repository: &FilesystemRepository, root_inode: u64) -> u64 {
     let date_time = chrono::Utc::now().naive_local();
     match repository.find_inode_by_remote_id("shared_drives") {
-        Some(inode) => inode,
+        Some(inode) => inode as u64,
         None => {
             let inode = repository.get_largest_inode() + 1;
             repository.create_entry(&FilesystemEntry {
@@ -222,12 +227,36 @@ fn create_shared_drives(repository: &FilesystemRepository, root_inode: i64) -> i
                 created_at: date_time,
                 last_modified_at: date_time,
                 remote_type: Some(RemoteType::Directory),
-                inode: inode,
+                inode,
                 size: 0,
-                parent_inode: Some(root_inode),
+                parent_inode: Some(root_inode as i64),
             });
 
-            inode
+            inode as u64
+        }
+    }
+}
+
+fn create_my_drives(repository: &FilesystemRepository, root_inode: u64) -> u64 {
+    let date_time = chrono::Utc::now().naive_local();
+    match repository.find_inode_by_remote_id("my_drives") {
+        Some(inode) => inode as u64,
+        None => {
+            let inode = repository.get_largest_inode() + 1;
+            repository.create_entry(&FilesystemEntry {
+                id: "my_drives".to_string(),
+                parent_id: Some("root".to_string()),
+                name: "My Drives".to_string(),
+                entry_type: EntryType::Directory,
+                created_at: date_time,
+                last_modified_at: date_time,
+                remote_type: Some(RemoteType::Directory),
+                inode,
+                size: 0,
+                parent_inode: Some(root_inode as i64),
+            });
+
+            inode as u64
         }
     }
 }

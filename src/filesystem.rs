@@ -72,18 +72,27 @@ pub(crate) struct GdriveFs {
     file_handles: Mutex<HashMap<u64, String>>,
     latest_file_handle: Mutex<Cell<u64>>,
     drive_client: Arc<DriveClient>,
+    root_inode: u64,
+    shared_drives_inode: u64,
+    my_drives_inode: u64,
 }
 
 impl GdriveFs {
     pub(crate) fn new(
         repository: Arc<FilesystemRepository>,
         drive_client: Arc<DriveClient>,
+        root_inode: u64,
+        shared_drives_inode: u64,
+        my_drives_inode: u64
     ) -> Self {
         Self {
             repository,
             file_handles: Mutex::new(HashMap::new()),
             latest_file_handle: Mutex::new(Cell::new(0)),
             drive_client,
+            root_inode,
+            shared_drives_inode,
+            my_drives_inode,
         }
     }
 
