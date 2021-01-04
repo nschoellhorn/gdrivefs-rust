@@ -20,10 +20,9 @@ use crate::drive_client::{ChangeList, DriveClient};
 use crate::filesystem::GdriveFs;
 use anyhow::Result;
 use indexing::IndexWriter;
-use std::io::prelude::*;
+use std::{io::prelude::*, path::Path};
 use std::io::{stdin, SeekFrom};
 use std::sync::Arc;
-use ::config::{File, Config as CConfig};
 use diesel_migrations::run_pending_migrations;
 use crate::config::Config;
 
@@ -48,15 +47,20 @@ async fn main() -> Result<()> {
         std::fs::create_dir(&config_dir)?;
     }
 
+    log::info!("Using config directory: {}", &config_dir.to_str().unwrap());
 
-    let mut config_repository = CConfig::default();
-    config_repository.merge(File::with_name("config")).unwrap();
-
-    let config = config_repository.try_into::<Config>().unwrap();
+    let config: Config = confy::load_path(&config_dir.join("config.toml")).expect("Unable to read configuration file.");
     let state_file_name = config_dir.join("state.txt");
 
+    let data_dir = Path::new(&config.cache.data_path);
+    if !data_dir.exists() {
+        std::fs::create_dir(data_dir)?;
+    }
+
+    log::info!("Using data directory: {}", data_dir.to_str().unwrap());
+
     let drive_client = Arc::new(create_drive_client(config.clone()).await?);
-    let connection_manager = diesel::r2d2::ConnectionManager::new(config_dir.join("filesystem.db").to_str().unwrap());
+    let connection_manager = diesel::r2d2::ConnectionManager::new(data_dir.join("filesystem.db").to_str().unwrap());
     let connection_pool = diesel::r2d2::Pool::builder()
         .max_size(10)
         .connection_customizer(Box::new(database::connection::ConnectionOptions {
