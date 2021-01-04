@@ -1,0 +1,3 @@
+DROP INDEX filesystem_inode_index;
+DROP INDEX filesystem_name_parent_index;
+DROP INDEX filesystem_parent_index;
