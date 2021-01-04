@@ -23,19 +23,19 @@ use indexing::IndexWriter;
 use std::io::prelude::*;
 use std::io::{stdin, SeekFrom};
 use std::sync::Arc;
-use ::config::{File, Config};
+use ::config::{File, Config as CConfig};
 use diesel_migrations::run_pending_migrations;
+use crate::config::Config;
 
 lazy_static! {
     static ref CREDENTIALS_PATH: &'static str = "clientCredentials.json";
-    
 }
 
 embed_migrations!("migrations/");
 
-async fn create_drive_client() -> Result<DriveClient> {
+async fn create_drive_client(config: Config) -> Result<DriveClient> {
     let blocking_client = tokio::task::spawn_blocking(|| reqwest::blocking::Client::new()).await?;
-    Ok(DriveClient::create(*CREDENTIALS_PATH, blocking_client).await?)
+    Ok(DriveClient::create(*CREDENTIALS_PATH, blocking_client, config).await?)
 }
 
 #[tokio::main]
@@ -45,12 +45,18 @@ async fn main() -> Result<()> {
     let config_dir = dirs::config_dir().unwrap().join("StreamDrive");
 
     if !config_dir.exists() {
-        std::fs::create_dir(config_dir)?;
+        std::fs::create_dir(&config_dir)?;
     }
 
-    let drive_client = Arc::new(create_drive_client().await?);
 
-    let connection_manager = diesel::r2d2::ConnectionManager::new("/Users/nschoellhorn/IdeaProjects/gdrivefs-rust/filesystem.db");
+    let mut config_repository = CConfig::default();
+    config_repository.merge(File::with_name("config")).unwrap();
+
+    let config = config_repository.try_into::<Config>().unwrap();
+    let state_file_name = config_dir.join("state.txt");
+
+    let drive_client = Arc::new(create_drive_client(config.clone()).await?);
+    let connection_manager = diesel::r2d2::ConnectionManager::new(config_dir.join("filesystem.db").to_str().unwrap());
     let connection_pool = diesel::r2d2::Pool::builder()
         .max_size(10)
         .connection_customizer(Box::new(database::connection::ConnectionOptions {
@@ -99,7 +105,7 @@ async fn main() -> Result<()> {
         .create(true)
         .write(true)
         .read(true)
-        .open("/Users/nschoellhorn/IdeaProjects/gdrivefs-rust/state.txt")?;
+        .open(&state_file_name)?;
 
     let mut current_token = String::new();
     state_file.read_to_string(&mut current_token)?;
@@ -107,7 +113,7 @@ async fn main() -> Result<()> {
     state_file = std::fs::OpenOptions::new()
         .write(true)
         .truncate(true)
-        .open("/Users/nschoellhorn/IdeaProjects/gdrivefs-rust/state.txt")?;
+        .open(&state_file_name)?;
 
     current_token = current_token.trim().to_string();
 
@@ -115,7 +121,7 @@ async fn main() -> Result<()> {
         current_token = "1".to_string();
     }
 
-    let indexing_worker = IndexWriter::new(connection_pool.clone());
+    let indexing_worker = IndexWriter::new(connection_pool.clone(), config.clone());
     let (indexing_handle, mut publisher) = indexing_worker.launch();
 
     let mut has_more = true;
