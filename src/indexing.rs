@@ -1,8 +1,17 @@
-use diesel::{SqliteConnection, r2d2::{ConnectionManager, Pool}};
-use tokio::{sync::mpsc::{Receiver, Sender}, task::JoinHandle};
+use diesel::{
+    r2d2::{ConnectionManager, Pool},
+    SqliteConnection,
+};
+use tokio::{
+    sync::mpsc::{Receiver, Sender},
+    task::JoinHandle,
+};
 
-use crate::{database::{EntryType, FilesystemEntry, FilesystemRepository, RemoteType}, drive_client::{Change, ChangeList, File}};
 use crate::config::Config;
+use crate::{
+    database::{EntryType, FilesystemEntry, FilesystemRepository, RemoteType},
+    drive_client::{Change, ChangeList, DriveClient, File},
+};
 
 pub(crate) struct IndexWriter {
     publisher: Sender<Change>,
@@ -86,7 +95,8 @@ impl IndexWorker {
         let parent_id = file.parents.first().map(|item| item.clone());
 
         let parent_inode = if let Some(parent_remote) = parent_id.as_ref() {
-            self.repository.find_inode_by_remote_id(parent_remote.as_str())
+            self.repository
+                .find_inode_by_remote_id(parent_remote.as_str())
         } else {
             None
         };
@@ -120,7 +130,32 @@ impl IndexWorker {
 
             // but then, we also update all entries that have the current remote id as the parent remote
             // to make sure they know about their parent inode as well
-            self.repository.set_parent_inode_by_parent_id(&remote_id, inode);
+            self.repository
+                .set_parent_inode_by_parent_id(&remote_id, inode);
+        }
+    }
+}
+
+struct IndexFetcher {
+    drive_client: Arc<DriveClient>,
+}
+
+impl IndexFetcher {
+    fn new(drive_client: Arc<DriveClient>) -> Self {
+        IndexFetcher { drive_client }
+    }
+}
+
+pub struct DriveIndex {
+    fetcher: IndexFetcher,
+    writer: IndexWriter,
+}
+
+impl DriveIndex {
+    pub fn new(drive_client: Arc<DriveClient>, pool: Pool<ConnectionManager<SqliteConnection>>, config: Config) -> Self {
+        Self {
+            fetcher: IndexFetcher::new(drive_client),
+            writer: IndexWriter::new(pool, config),
         }
     }
 }

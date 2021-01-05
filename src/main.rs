@@ -9,22 +9,22 @@ extern crate diesel;
 #[macro_use]
 extern crate diesel_migrations;
 
+mod config;
 mod database;
 mod drive_client;
 mod filesystem;
 mod indexing;
-mod config;
 
+use crate::config::Config;
 use crate::database::{EntryType, FilesystemEntry, FilesystemRepository, RemoteType};
 use crate::drive_client::{ChangeList, DriveClient};
 use crate::filesystem::GdriveFs;
 use anyhow::Result;
-use indexing::IndexWriter;
-use std::{io::prelude::*, path::Path};
+use diesel_migrations::run_pending_migrations;
+use indexing::{DriveIndex, IndexWriter};
 use std::io::{stdin, SeekFrom};
 use std::sync::Arc;
-use diesel_migrations::run_pending_migrations;
-use crate::config::Config;
+use std::{io::prelude::*, path::Path};
 
 lazy_static! {
     static ref CREDENTIALS_PATH: &'static str = "clientCredentials.json";
@@ -49,7 +49,8 @@ async fn main() -> Result<()> {
 
     log::info!("Using config directory: {}", &config_dir.to_str().unwrap());
 
-    let config: Config = confy::load_path(&config_dir.join("config.toml")).expect("Unable to read configuration file.");
+    let config: Config = confy::load_path(&config_dir.join("config.toml"))
+        .expect("Unable to read configuration file.");
     let state_file_name = config_dir.join("state.txt");
 
     let data_dir = Path::new(&config.cache.data_path);
@@ -62,11 +63,11 @@ async fn main() -> Result<()> {
         std::fs::create_dir(mount_dir)?;
     }
 
-
     log::info!("Using data directory: {}", data_dir.to_str().unwrap());
 
     let drive_client = Arc::new(create_drive_client(config.clone()).await?);
-    let connection_manager = diesel::r2d2::ConnectionManager::new(data_dir.join("filesystem.db").to_str().unwrap());
+    let connection_manager =
+        diesel::r2d2::ConnectionManager::new(data_dir.join("filesystem.db").to_str().unwrap());
     let connection_pool = diesel::r2d2::Pool::builder()
         .max_size(10)
         .connection_customizer(Box::new(database::connection::ConnectionOptions {
@@ -104,10 +105,10 @@ async fn main() -> Result<()> {
 
     let filesystem = GdriveFs::new(
         Arc::clone(&repository),
-         Arc::clone(&drive_client),
-         root_inode,
-         shared_drives_inode,
-         my_drives_inode
+        Arc::clone(&drive_client),
+        root_inode,
+        shared_drives_inode,
+        my_drives_inode,
     );
 
     log::info!("Starting indexing.");
@@ -131,6 +132,11 @@ async fn main() -> Result<()> {
         current_token = "1".to_string();
     }
 
+    let drive_index = DriveIndex::new(
+        Arc::clone(&drive_client),
+        connection_pool.clone(),
+        config.clone(),
+    );
     let indexing_worker = IndexWriter::new(connection_pool.clone(), config.clone());
     let (indexing_handle, mut publisher) = indexing_worker.launch();
 
@@ -184,12 +190,14 @@ async fn main() -> Result<()> {
             .expect("Failed to reset write pointer to start of file.");
     }
 
-    log::info!("Indexing finished, mounting filesystem on {}.", &config.general.mount_path);
+    log::info!(
+        "Indexing finished, mounting filesystem on {}.",
+        &config.general.mount_path
+    );
 
     let mount_path = config.general.mount_path.clone();
     let handle = tokio::task::spawn_blocking(|| {
-        fuse::mount(filesystem, mount_path, &[])
-            .expect("unable to mount FUSE filesystem");
+        fuse::mount(filesystem, mount_path, &[]).expect("unable to mount FUSE filesystem");
     });
 
     let mut input = String::new();
@@ -203,15 +211,15 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os="linux")]
-fn unmount(path: &str)  {
+#[cfg(target_os = "linux")]
+fn unmount(path: &str) {
     let mut command = std::process::Command::new("fusermount");
     command.arg("-u").arg(path);
 
     command.spawn().unwrap().wait().expect("Failed to unmount.");
 }
 
-#[cfg(target_os="macos")]
+#[cfg(target_os = "macos")]
 fn unmount(path: &str) {
     let mut command = std::process::Command::new("umount");
     command.arg(path);
