@@ -144,8 +144,6 @@ impl DriveClient {
         let token = lock.take();
         lock.set(token.clone());
 
-        dbg!(&token);
-        println!("Got Token");
         Ok(self
             .blocking_client
             .get(format!("{}{}", *GDRIVE_BASE_URL, url).as_str())

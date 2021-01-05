@@ -57,6 +57,12 @@ async fn main() -> Result<()> {
         std::fs::create_dir(data_dir)?;
     }
 
+    let mount_dir = Path::new(&config.general.mount_path);
+    if !mount_dir.exists() {
+        std::fs::create_dir(mount_dir)?;
+    }
+
+
     log::info!("Using data directory: {}", data_dir.to_str().unwrap());
 
     let drive_client = Arc::new(create_drive_client(config.clone()).await?);
@@ -178,25 +184,39 @@ async fn main() -> Result<()> {
             .expect("Failed to reset write pointer to start of file.");
     }
 
-    log::info!("Indexing finished, mounting filesystem.");
+    log::info!("Indexing finished, mounting filesystem on {}.", &config.general.mount_path);
 
+    let mount_path = config.general.mount_path.clone();
     let handle = tokio::task::spawn_blocking(|| {
-        fuse::mount(filesystem, "/Users/nschoellhorn/testfs", &[])
+        fuse::mount(filesystem, mount_path, &[])
             .expect("unable to mount FUSE filesystem");
     });
 
     let mut input = String::new();
     stdin().read_line(&mut input).unwrap();
 
-    let mut command = std::process::Command::new("fusermount");
-    command.arg("-u").arg("/Users/nschoellhorn/testfs");
-
-    command.spawn().unwrap().wait().expect("Filesystem wasn't unmounted successfully, try running this yourself: fusermount -u /home/nschoellhorn/testfs");
+    unmount(&config.general.mount_path);
 
     handle.await?;
     indexing_handle.await?;
 
     Ok(())
+}
+
+#[cfg(target_os="linux")]
+fn unmount(path: &str)  {
+    let mut command = std::process::Command::new("fusermount");
+    command.arg("-u").arg(path);
+
+    command.spawn().unwrap().wait().expect("Failed to unmount.");
+}
+
+#[cfg(target_os="macos")]
+fn unmount(path: &str) {
+    let mut command = std::process::Command::new("umount");
+    command.arg(path);
+
+    command.spawn().unwrap().wait().expect("Failed to unmount.");
 }
 
 fn create_root(repository: &FilesystemRepository) -> u64 {
