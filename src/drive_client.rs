@@ -13,7 +13,7 @@ use yup_oauth2::{InstalledFlowAuthenticator, InstalledFlowReturnMethod};
 
 use serde::{Deserialize, Serialize};
 
-use crate::FETCH_SIZE;
+use crate::config::Config;
 
 lazy_static! {
     static ref SCOPES: [&'static str; 1] = ["https://www.googleapis.com/auth/drive",];
@@ -87,12 +87,14 @@ pub struct DriveClient {
     blocking_client: reqwest::blocking::Client,
     authenticator: Authenticator<HttpsConnector<HttpConnector>>,
     token: Arc<Mutex<Cell<String>>>,
+    config: Config,
 }
 
 impl DriveClient {
     pub async fn create(
         credentials_path: &str,
         blocking_client: reqwest::blocking::Client,
+        config: Config,
     ) -> Result<Self> {
         // Read the application secret
         let secret = yup_oauth2::read_application_secret(credentials_path)
@@ -111,6 +113,7 @@ impl DriveClient {
             blocking_client,
             authenticator: auth,
             token: Arc::new(Mutex::new(Cell::new(String::new()))),
+            config,
         })
     }
 
@@ -141,8 +144,6 @@ impl DriveClient {
         let token = lock.take();
         lock.set(token.clone());
 
-        dbg!(&token);
-        println!("Got Token");
         Ok(self
             .blocking_client
             .get(format!("{}{}", *GDRIVE_BASE_URL, url).as_str())
@@ -173,7 +174,7 @@ impl DriveClient {
                     ("supportsAllDrives", "true"),
                     ("driveId", drive_id),
                     ("fields", "nextPageToken, newStartPageToken, changes(type, changeType, time, removed, fileId, file(id, name, mimeType, parents, createdTime, modifiedTime, size))"),
-                    ("pageSize", &format!("{}", *FETCH_SIZE)),
+                    ("pageSize", &format!("{}", self.config.indexing.fetch_size)),
                 ]).send().await;
 
         if response.is_err() {

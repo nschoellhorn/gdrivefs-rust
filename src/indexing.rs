@@ -2,7 +2,7 @@ use diesel::{SqliteConnection, r2d2::{ConnectionManager, Pool}};
 use tokio::{sync::mpsc::{Receiver, Sender}, task::JoinHandle};
 
 use crate::{database::{EntryType, FilesystemEntry, FilesystemRepository, RemoteType}, drive_client::{Change, ChangeList, File}};
-use crate::{BATCH_SIZE, BUFFER_SIZE};
+use crate::config::Config;
 
 pub(crate) struct IndexWriter {
     publisher: Sender<Change>,
@@ -10,11 +10,11 @@ pub(crate) struct IndexWriter {
 }
 
 impl IndexWriter {
-    pub(crate) fn new(pool: Pool<ConnectionManager<SqliteConnection>>) -> Self {
-        let (tx, rx) = tokio::sync::mpsc::channel(*BUFFER_SIZE);
+    pub(crate) fn new(pool: Pool<ConnectionManager<SqliteConnection>>, config: Config) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(config.indexing.buffer_size);
         IndexWriter {
             publisher: tx,
-            worker: IndexWorker::new(rx, FilesystemRepository::new(pool)),
+            worker: IndexWorker::new(rx, FilesystemRepository::new(pool), config),
         }
     }
 
@@ -26,13 +26,15 @@ impl IndexWriter {
 struct IndexWorker {
     receiver: Receiver<Change>,
     repository: FilesystemRepository,
+    config: Config,
 }
 
 impl IndexWorker {
-    fn new(receiver: Receiver<Change>, repository: FilesystemRepository) -> Self {
+    fn new(receiver: Receiver<Change>, repository: FilesystemRepository, config: Config) -> Self {
         IndexWorker {
             receiver,
-            repository
+            repository,
+            config,
         }
     }
 
@@ -43,14 +45,14 @@ impl IndexWorker {
     }
 
     async fn worker_loop(&mut self) {
-        let mut batch = Vec::with_capacity(*BATCH_SIZE);
+        let mut batch = Vec::with_capacity(self.config.indexing.batch_size);
         while let Some(change) = self.receiver.recv().await {
             batch.push(change);
 
             // We collect a batch of 1000 changes and execute all of them in one transaction
-            if batch.len() == *BATCH_SIZE {
+            if batch.len() == self.config.indexing.batch_size {
                 self.process_batch(batch);
-                batch = Vec::with_capacity(*BATCH_SIZE);
+                batch = Vec::with_capacity(self.config.indexing.batch_size);
             }
         }
     }
@@ -80,9 +82,6 @@ impl IndexWorker {
     }
 
     fn process_create(&self, file: File) {
-        if file.parents.is_empty() {
-            dbg!("Found empty parents for file: {}", &file);
-        }
         let remote_id = file.id;
         let parent_id = file.parents.first().map(|item| item.clone());
 

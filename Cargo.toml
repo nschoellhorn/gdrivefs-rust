@@ -10,7 +10,7 @@ edition = "2018"
 anyhow = "1.0.31"
 reqwest = { version = "0.10.6", features = ["json", "blocking"] }
 yup-oauth2 = "4.1.2"
-config = "0.10.1"
+dirs = "3.0.1"
 tokio = { version = "0.2.21", features = ["full"] }
 lazy_static = "1.4.0"
 hyper = "0.13.6"
@@ -22,8 +22,10 @@ futures = "0.3.5"
 libc = "0.2.73"
 diesel = { version = "1.4.5", features = ["sqlite", "chrono", "r2d2"] }
 diesel-derive-enum = { version = "1", features = ["sqlite"] }
+diesel_migrations = "1.4.0"
 fuse = { git = "https://github.com/zargony/fuse-rs/", branch = "master" }
 bytes = "0.5.6"
 async-scoped = "0.4.1"
 log = "0.4"
 simple_logger = "1.6.0"
+confy = "0.4.0"

@@ -72,18 +72,27 @@ pub(crate) struct GdriveFs {
     file_handles: Mutex<HashMap<u64, String>>,
     latest_file_handle: Mutex<Cell<u64>>,
     drive_client: Arc<DriveClient>,
+    root_inode: u64,
+    shared_drives_inode: u64,
+    my_drives_inode: u64,
 }
 
 impl GdriveFs {
     pub(crate) fn new(
         repository: Arc<FilesystemRepository>,
         drive_client: Arc<DriveClient>,
+        root_inode: u64,
+        shared_drives_inode: u64,
+        my_drives_inode: u64
     ) -> Self {
         Self {
             repository,
             file_handles: Mutex::new(HashMap::new()),
             latest_file_handle: Mutex::new(Cell::new(0)),
             drive_client,
+            root_inode,
+            shared_drives_inode,
+            my_drives_inode,
         }
     }
 
@@ -181,36 +190,15 @@ impl Filesystem for GdriveFs {
         entry_name: &OsStr,
         reply: ReplyEntry,
     ) {
-        if entry_name.to_str().unwrap().starts_with("P18009") {
-            println!("Start lookup Payment Clarity");
-        }
-
         // We need to look up top level directories, which are the drives in our case
         let entry = self
             .repository
             .find_entry_as_child(parent_inode as i64, entry_name);
         match entry {
             Some(fs_entry) => {
-                if entry_name.to_str().unwrap().starts_with("P18009") {
-                    println!("Lookup for Payment Clarity");
-                    dbg!(get_attr(&fs_entry));
-                }
-
                 reply.entry(&TTL, &get_attr(&fs_entry), 0)
             },
             None => {
-                if !entry_name.to_str().unwrap().starts_with("._") {
-                    println!(
-                        r#"
-                        Call Errored: lookup()
-                        Request: {:?}
-                        Inode: {}
-                        Entry Name: {:?}
-                        "#,
-                        request, parent_inode, entry_name
-                    );
-                }
-
                 reply.error(ENOENT)
             }
         }
@@ -268,7 +256,6 @@ impl Filesystem for GdriveFs {
 
         let mut current_offset = offset + 1;
         for entry in iterator {
-            println!("Adding entry {:?}", &entry.name);
             let result = reply.add(
                 entry.inode as u64,
                 current_offset,
@@ -284,16 +271,6 @@ impl Filesystem for GdriveFs {
         }
 
         if inode_exists {
-            /*println!(
-                r#"
-                Call Succeeded: readdir()
-                Request: {:?}
-                Inode: {}
-                File Handle: {}
-                Offset: {}
-                "#,
-                request, inode, file_handle, offset
-            );*/
             reply.ok();
         } else {
             println!(
