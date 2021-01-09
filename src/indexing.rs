@@ -1,10 +1,14 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use diesel::{
     r2d2::{ConnectionManager, Pool},
     SqliteConnection,
 };
 use tokio::{
-    sync::mpsc::{Receiver, Sender},
+    sync::{
+        mpsc::{Receiver, Sender},
+        Mutex,
+    },
     task::JoinHandle,
 };
 
@@ -13,9 +17,12 @@ use crate::{
     database::{EntryType, FilesystemEntry, FilesystemRepository, RemoteType},
     drive_client::{Change, ChangeList, DriveClient, File},
 };
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
 use std::sync::Arc;
+use std::{
+    cell::RefCell,
+    io::{Read, Seek, SeekFrom, Write},
+};
+use std::path::PathBuf;
 
 pub(crate) struct IndexWriter {
     publisher: Sender<Change>,
@@ -36,10 +43,16 @@ impl IndexWriter {
     }
 }
 
+struct ChangeBatch {
+    changes: Vec<Change>,
+    latest_change_received: Option<DateTime<Utc>>,
+}
+
 struct IndexWorker {
     receiver: Receiver<Change>,
     repository: FilesystemRepository,
     config: Config,
+    batch: Arc<Mutex<RefCell<ChangeBatch>>>,
 }
 
 impl IndexWorker {
@@ -47,69 +60,143 @@ impl IndexWorker {
         IndexWorker {
             receiver,
             repository,
+            batch: Arc::new(Mutex::new(RefCell::new(IndexWorker::init_batch(
+                config.indexing.batch_size,
+            )))),
             config,
         }
     }
 
     fn launch(mut self) -> JoinHandle<()> {
+        let batch_arc = Arc::clone(&self.batch);
+        let flush_interval = self.config.indexing.batch_flush_interval;
+        let batch_size = self.config.indexing.batch_size;
+        let repository = self.repository.clone();
+        tokio::spawn(async move {
+            Self::flush_loop(batch_arc, &repository, flush_interval, batch_size).await;
+        });
+
         tokio::spawn(async move {
             self.worker_loop().await;
         })
     }
 
+    async fn flush_loop(
+        batch: Arc<Mutex<RefCell<ChangeBatch>>>,
+        repository: &FilesystemRepository,
+        flush_interval: u8,
+        batch_size: usize,
+    ) {
+        loop {
+            let current_time = Utc::now();
+            let batch_time_option = {
+                let batch_lock = batch.lock().await;
+                let batch_ref = (*batch_lock).borrow();
+
+                batch_ref.latest_change_received
+            };
+
+            if let Some(batch_time) = batch_time_option {
+                if current_time.signed_duration_since(batch_time).num_seconds()
+                    >= (flush_interval as i64)
+                {
+                    Self::flush(Arc::clone(&batch), repository, batch_size)
+                        .await
+                        .expect("Unable to flush in flush loop.");
+                }
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
     async fn worker_loop(&mut self) {
-        let mut batch = Vec::with_capacity(self.config.indexing.batch_size);
         while let Some(change) = self.receiver.recv().await {
-            batch.push(change);
+            let batch = self.batch.lock().await;
+
+            {
+                let mut mut_batch = batch.borrow_mut();
+
+                mut_batch.changes.push(change);
+                mut_batch.latest_change_received = Some(Utc::now());
+            }
 
             // We collect a batch of 1000 changes and execute all of them in one transaction
-            if batch.len() == self.config.indexing.batch_size {
-                self.process_batch(batch);
-                batch = Vec::with_capacity(self.config.indexing.batch_size);
+            if (*batch).borrow().changes.len() == self.config.indexing.batch_size {
+                Self::flush(
+                    Arc::clone(&self.batch),
+                    &self.repository,
+                    self.config.indexing.batch_size,
+                )
+                .await
+                .expect("Unable to flush batch");
             }
         }
     }
 
-    fn process_batch(&self, batch: Vec<Change>) -> Result<(), anyhow::Error> {
-        self.repository.transaction::<(), anyhow::Error, _>(|| {
+    async fn flush(
+        batch: Arc<Mutex<RefCell<ChangeBatch>>>,
+        repository: &FilesystemRepository,
+        batch_size: usize,
+    ) -> Result<(), anyhow::Error> {
+        let batch = batch.lock().await;
+        let finished_batch = batch.replace(IndexWorker::init_batch(batch_size));
+
+        log::info!("Flushing batch of {} items.", finished_batch.changes.len());
+
+        Self::process_batch(finished_batch, repository)
+    }
+
+    fn init_batch(capacity: usize) -> ChangeBatch {
+        ChangeBatch {
+            changes: Vec::with_capacity(capacity),
+            latest_change_received: None,
+        }
+    }
+
+    fn process_batch(
+        batch: ChangeBatch,
+        repository: &FilesystemRepository,
+    ) -> Result<(), anyhow::Error> {
+        repository.transaction::<(), anyhow::Error, _>(|| {
             batch
+                .changes
                 .into_iter()
                 .filter(|change| change.r#type == "file")
-                .for_each(|change| self.process_change(change));
+                .for_each(|change| Self::process_change(change, repository));
 
             Ok(())
         })
     }
 
-    fn process_change(&self, change: Change) {
-        if change.removed {
-            self.process_delete(change.fileId.unwrap());
+    fn process_change(change: Change, repository: &FilesystemRepository) {
+        if change.removed || change.file.is_some() && change.file.clone().unwrap().trashed {
+            Self::process_delete(change.fileId.unwrap(), repository);
         } else {
-            self.process_create(change.file.unwrap());
+            Self::process_create(change.file.unwrap(), repository);
         }
     }
 
-    fn process_delete(&self, remote_id: String) {
-        self.repository
+    fn process_delete(remote_id: String, repository: &FilesystemRepository) {
+        repository
             .remove_entry_by_remote_id(remote_id.as_str())
             .expect("Unable to execute delete.");
     }
 
-    fn process_create(&self, file: File) {
+    fn process_create(file: File, repository: &FilesystemRepository) {
         let remote_id = file.id;
         let parent_id = file.parents.first().map(|item| item.clone());
 
         let parent_inode = if let Some(parent_remote) = parent_id.as_ref() {
-            self.repository
-                .find_inode_by_remote_id(parent_remote.as_str())
+            repository.find_inode_by_remote_id(parent_remote.as_str())
         } else {
             None
         };
 
-        if let None = self.repository.find_inode_by_remote_id(remote_id.as_str()) {
+        if let None = repository.find_inode_by_remote_id(remote_id.as_str()) {
             // First, we create the new entry itself
-            let inode = self.repository.get_largest_inode() + 1;
-            self.repository.create_entry(&FilesystemEntry {
+            let inode = repository.get_largest_inode() + 1;
+            repository.create_entry(&FilesystemEntry {
                 inode,
                 parent_id: parent_id,
                 name: file.name,
@@ -135,7 +222,7 @@ impl IndexWorker {
 
             // but then, we also update all entries that have the current remote id as the parent remote
             // to make sure they know about their parent inode as well
-            self.repository
+            repository
                 .set_parent_inode_by_parent_id(&remote_id, inode)
                 .expect("Failed to update parent inodes");
         }
@@ -208,6 +295,22 @@ impl DriveIndex {
         Ok(())
     }
 
+    pub fn start_background_indexing(mut self) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                self.config.indexing.background_refresh_interval as u64,
+            ));
+            loop {
+                interval.tick().await;
+                log::info!("Fetching new changes from Google Drive");
+
+                self.process_pending_changes()
+                    .await
+                    .expect("Background indexing tick failed.");
+            }
+        })
+    }
+
     async fn process_pending_changes(&mut self) -> Result<()> {
         let mut has_more = true;
         let drive_id = self.config.general.drive_id.as_str();
@@ -232,9 +335,6 @@ impl DriveIndex {
             current_token = "1".to_string();
         }
 
-        dbg!(&current_token);
-        dbg!(drive_id);
-
         while has_more {
             let current_token_str = current_token.as_str();
 
@@ -254,8 +354,6 @@ impl DriveIndex {
             } else {
                 result.unwrap()
             };
-
-            dbg!(&change_list);
 
             let start_page_token = change_list.new_start_page_token.clone();
             let next_page_token = change_list.next_page_token.clone();

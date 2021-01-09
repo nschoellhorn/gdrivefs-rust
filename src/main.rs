@@ -32,11 +32,6 @@ lazy_static! {
 
 embed_migrations!("migrations/");
 
-async fn create_drive_client(config: Config) -> Result<DriveClient> {
-    let blocking_client = tokio::task::spawn_blocking(|| reqwest::blocking::Client::new()).await?;
-    Ok(DriveClient::create(*CREDENTIALS_PATH, blocking_client, config).await?)
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     simple_logger::init_with_level(log::Level::Info).unwrap();
@@ -68,7 +63,9 @@ async fn main() -> Result<()> {
 
     log::info!("Using data directory: {}", data_dir.to_str().unwrap());
 
-    let drive_client = Arc::new(create_drive_client(config.clone()).await?);
+    let blocking_client = tokio::task::spawn_blocking(|| reqwest::blocking::Client::new()).await?;
+    let drive_client =
+        Arc::new(DriveClient::create(*CREDENTIALS_PATH, blocking_client, config.clone()).await?);
     let connection_manager =
         diesel::r2d2::ConnectionManager::new(data_dir.join("filesystem.db").to_str().unwrap());
     let connection_pool = diesel::r2d2::Pool::builder()
@@ -118,12 +115,16 @@ async fn main() -> Result<()> {
         fuse::mount(filesystem, mount_path, &[]).expect("unable to mount FUSE filesystem");
     });
 
+    // Make sure we get live updates about all the changes to the drive
+    let background_index_handle = drive_index.start_background_indexing();
+
     let mut input = String::new();
     stdin().read_line(&mut input).unwrap();
 
     unmount(&config.general.mount_path);
 
     handle.await?;
+    background_index_handle.await?;
 
     Ok(())
 }

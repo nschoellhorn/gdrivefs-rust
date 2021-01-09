@@ -64,6 +64,7 @@ pub struct File {
     pub modified_time: DateTime<Utc>,
     pub mime_type: String,
     pub size: Option<String>,
+    pub trashed: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -209,7 +210,7 @@ impl DriveClient {
                     ("includeItemsFromAllDrives", "true"),
                     ("supportsAllDrives", "true"),
                     ("driveId", drive_id),
-                    ("fields", "nextPageToken, newStartPageToken, changes(type, changeType, time, removed, fileId, file(id, name, mimeType, parents, createdTime, modifiedTime, size))"),
+                    ("fields", "nextPageToken, newStartPageToken, changes(type, changeType, time, removed, fileId, file(id, name, mimeType, parents, createdTime, modifiedTime, size, trashed))"),
                     ("pageSize", &format!("{}", self.config.indexing.fetch_size)),
                 ]).send().await;
 

@@ -13,6 +13,8 @@ pub struct IndexingConfig {
     pub batch_size: usize,
     pub fetch_size: usize,
     pub buffer_size: usize,
+    pub batch_flush_interval: u8,
+    pub background_refresh_interval: u8,
 }
 
 impl Default for IndexingConfig {
@@ -21,6 +23,8 @@ impl Default for IndexingConfig {
             batch_size: 512,
             fetch_size: 1000,
             buffer_size: 4096,
+            batch_flush_interval: 10,
+            background_refresh_interval: 30,
         }
     }
 }

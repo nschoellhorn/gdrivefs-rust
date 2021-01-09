@@ -45,6 +45,7 @@ pub struct FilesystemEntry {
     pub parent_inode: Option<i64>,
 }
 
+#[derive(Clone)]
 pub struct FilesystemRepository {
     connection: Pool<ConnectionManager<SqliteConnection>>,
 }
