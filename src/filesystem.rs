@@ -53,7 +53,7 @@ fn get_attr(entry: &FilesystemEntry) -> FileAttr {
         ctime: modified,
         crtime: created,
         kind,
-        perm: 0o755,
+        perm: 0o700,
         nlink: 2,
         uid: 1000, // TODO: which user id do we wanna use? Just the current user?
         gid: 1000, // TODO: which group id do we wanna use? Just the current group?
