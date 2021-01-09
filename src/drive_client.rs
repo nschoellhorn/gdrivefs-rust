@@ -150,6 +150,42 @@ impl DriveClient {
             .header(header::AUTHORIZATION, format!("Bearer {}", token)))
     }
 
+    pub(crate) fn process_folder_recursively<'a, F>(
+        &'a self,
+        parent_id: String,
+        callback: &'a impl Fn(File) -> F,
+    ) -> LocalBoxFuture<'a, Result<()>>
+    where
+        F: Future<Output = Result<()>>,
+    {
+        async move {
+            let files = self
+                .get_files_in_parent(&parent_id)
+                .await
+                .expect("Unable to get files in drive.");
+            let mut tasks = vec![];
+            let mut tasks2 = vec![];
+            files.into_iter().for_each(|file| {
+                tasks.push(callback(file.clone()));
+
+                if file.mime_type == "application/vnd.google-apps.folder" {
+                    tasks2.push(self.process_folder_recursively(file.id, callback));
+                }
+            });
+
+            for task in tasks {
+                task.await?;
+            }
+
+            for task in tasks2 {
+                task.await?;
+            }
+
+            Ok(())
+        }
+        .boxed_local()
+    }
+
     pub async fn get_start_page_token(&self, drive_id: &str) -> Result<String> {
         Ok(self
             .get_authenticated("/changes/startPageToken")
@@ -199,8 +235,10 @@ impl DriveClient {
         byte_from: u64,
         byte_to: u64,
     ) -> Result<bytes::Bytes> {
+        let request_url = format!("/files/{}", file_id);
+        dbg!(&request_url);
         let mut request =
-            self.get_authenticated_blocking(format!("/files/{}", file_id).as_str())?;
+            self.get_authenticated_blocking(request_url.as_str())?;
         let params = vec![
             ("alt".to_string(), "media".to_string()),
             ("supportsAllDrives".to_string(), "true".to_string()),

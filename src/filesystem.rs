@@ -1,6 +1,6 @@
-use crate::database::EntryType::File;
 use crate::database::{EntryType, FilesystemEntry, FilesystemRepository};
 use crate::drive_client::DriveClient;
+use crate::drive_client::File;
 use chrono::{DateTime, NaiveDateTime};
 use diesel::dsl::exists;
 use diesel::prelude::*;
@@ -9,7 +9,7 @@ use fuse::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
     ReplyOpen, ReplyStatfs, Request,
 };
-use libc::ENOENT;
+use libc::{EIO, ENOENT};
 use std::boxed::Box;
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -42,10 +42,7 @@ fn get_attr(entry: &FilesystemEntry) -> FileAttr {
         entry.last_modified_at.timestamp() as u64
     ));
 
-    let kind = match entry.entry_type {
-        EntryType::File => FileType::RegularFile,
-        EntryType::Directory => FileType::Directory,
-    };
+    let kind = GdriveFs::entry_type_to_file_type(&entry.entry_type);
 
     FileAttr {
         ino: entry.inode as u64,
@@ -83,7 +80,7 @@ impl GdriveFs {
         drive_client: Arc<DriveClient>,
         root_inode: u64,
         shared_drives_inode: u64,
-        my_drives_inode: u64
+        my_drives_inode: u64,
     ) -> Self {
         Self {
             repository,
@@ -96,8 +93,9 @@ impl GdriveFs {
         }
     }
 
-    fn to_file_type(entry_type: &EntryType) -> FileType {
+    fn entry_type_to_file_type(entry_type: &EntryType) -> FileType {
         match entry_type {
+            EntryType::Drive => FileType::Directory,
             EntryType::File => FileType::RegularFile,
             EntryType::Directory => FileType::Directory,
         }
@@ -129,6 +127,47 @@ impl Filesystem for GdriveFs {
 
         reply.error(ENOENT);
     }*/
+
+    fn lookup(
+        &mut self,
+        _request: &Request,
+        parent_inode: u64,
+        entry_name: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        // We need to look up top level directories, which are the drives in our case
+        let entry = self
+            .repository
+            .find_entry_as_child(parent_inode as i64, entry_name);
+        match entry {
+            Some(fs_entry) => reply.entry(&TTL, &get_attr(&fs_entry), 0),
+            None => reply.error(ENOENT),
+        }
+    }
+
+    fn getattr(&mut self, request: &Request, inode: u64, reply: ReplyAttr) {
+        match inode {
+            1 => reply.attr(&TTL, &ROOT_DIR_ATTR),
+            _ => {
+                let entry = self.repository.find_entry_for_inode(inode);
+                match entry {
+                    Some(fs_entry) => reply.attr(&TTL, &get_attr(&fs_entry)),
+                    None => {
+                        println!(
+                            r#"
+                            Call Errored: getattr()
+                            Request: {:?}
+                            Inode: {}
+                            "#,
+                            request, inode
+                        );
+
+                        reply.error(ENOENT)
+                    }
+                }
+            }
+        }
+    }
 
     fn open(&mut self, _req: &Request, _ino: u64, _flags: u32, reply: ReplyOpen) {
         let fs_entry = self.repository.find_entry_for_inode(_ino);
@@ -166,13 +205,18 @@ impl Filesystem for GdriveFs {
             _offset, _size, _ino
         );
         let client = Arc::clone(&self.drive_client);
-        let data = client
-            .get_file_content(
-                remote_id.as_str(),
-                _offset as u64,
-                (_offset + _size as i64) as u64 - 1,
-            )
-            .expect("Unable to retrieve file content");
+        let data = client.get_file_content(
+            remote_id.as_str(),
+            _offset as u64,
+            (_offset + _size as i64) as u64 - 1,
+        );
+
+        if let Err(_) = data {
+            reply.error(EIO);
+            return;
+        }
+
+        let data = data.unwrap();
 
         use std::borrow::Borrow;
         println!(
@@ -181,51 +225,6 @@ impl Filesystem for GdriveFs {
         );
         println!("Our reply is {} long", data.len());
         reply.data(data.borrow());
-    }
-
-    fn lookup(
-        &mut self,
-        request: &Request,
-        parent_inode: u64,
-        entry_name: &OsStr,
-        reply: ReplyEntry,
-    ) {
-        // We need to look up top level directories, which are the drives in our case
-        let entry = self
-            .repository
-            .find_entry_as_child(parent_inode as i64, entry_name);
-        match entry {
-            Some(fs_entry) => {
-                reply.entry(&TTL, &get_attr(&fs_entry), 0)
-            },
-            None => {
-                reply.error(ENOENT)
-            }
-        }
-    }
-
-    fn getattr(&mut self, request: &Request, inode: u64, reply: ReplyAttr) {
-        match inode {
-            1 => reply.attr(&TTL, &ROOT_DIR_ATTR),
-            _ => {
-                let entry = self.repository.find_entry_for_inode(inode);
-                match entry {
-                    Some(fs_entry) => reply.attr(&TTL, &get_attr(&fs_entry)),
-                    None => {
-                        println!(
-                            r#"
-                            Call Errored: getattr()
-                            Request: {:?}
-                            Inode: {}
-                            "#,
-                            request, inode
-                        );
-
-                        reply.error(ENOENT)
-                    }
-                }
-            }
-        }
     }
 
     /*fn statfs(&mut self, request: &Request, inode: u64, reply: ReplyStatfs) {
@@ -250,16 +249,14 @@ impl Filesystem for GdriveFs {
 
         let results = self.repository.find_all_entries_in_parent(inode);
 
-        let iterator = results
-            .iter()
-            .skip(offset as usize);
+        let iterator = results.iter().skip(offset as usize);
 
         let mut current_offset = offset + 1;
         for entry in iterator {
             let result = reply.add(
                 entry.inode as u64,
                 current_offset,
-                GdriveFs::to_file_type(&entry.entry_type),
+                GdriveFs::entry_type_to_file_type(&entry.entry_type),
                 entry.name.clone(),
             );
 
@@ -286,17 +283,5 @@ impl Filesystem for GdriveFs {
 
             reply.error(ENOENT);
         }
-    }
-
-    fn releasedir(
-        &mut self,
-        request: &Request,
-        inode: u64,
-        file_handle: u64,
-        flags: u32,
-        reply: ReplyEmpty,
-    ) {
-        // we currently dont really have anything to release
-        reply.ok()
     }
 }
