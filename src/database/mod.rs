@@ -17,12 +17,14 @@ mod schema;
 
 #[derive(Debug, DbEnum, Hash, Eq, PartialEq)]
 pub enum EntryType {
+    Drive,
     File,
     Directory,
 }
 
 #[derive(Debug, DbEnum)]
 pub enum RemoteType {
+    OwnDrive,
     TeamDrive,
     Directory,
     File,
@@ -68,6 +70,14 @@ impl FilesystemRepository {
     {
         let connection = self.connection.get().unwrap();
         connection.transaction(f)
+    }
+
+    pub(crate) fn get_all_drive_ids(&self) -> Vec<String> {
+        filesystem
+            .select(id)
+            .filter(entry_type.eq(EntryType::Drive))
+            .load::<String>(&self.connection.get().unwrap())
+            .expect("Unable to fetch known drives")
     }
 
     pub(crate) fn find_parent_id(&self, i: String) -> Option<String> {
@@ -159,7 +169,10 @@ impl FilesystemRepository {
         diesel::insert_into(filesystem::table)
             .values(fs_entry)
             .execute(&self.connection.get().unwrap())
-            .expect("Unable to insert new entry");
+            .expect(&format!(
+                "Unable to insert new entry: {}#{}",
+                fs_entry.name, fs_entry.id
+            ));
     }
 
     pub(crate) fn set_parent_inode_by_parent_id(&self, p_id: &str, p_inode: i64) -> Result<usize> {
