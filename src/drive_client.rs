@@ -64,6 +64,7 @@ pub struct File {
     pub modified_time: DateTime<Utc>,
     pub mime_type: String,
     pub size: Option<String>,
+    pub trashed: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -150,6 +151,42 @@ impl DriveClient {
             .header(header::AUTHORIZATION, format!("Bearer {}", token)))
     }
 
+    pub(crate) fn process_folder_recursively<'a, F>(
+        &'a self,
+        parent_id: String,
+        callback: &'a impl Fn(File) -> F,
+    ) -> LocalBoxFuture<'a, Result<()>>
+    where
+        F: Future<Output = Result<()>>,
+    {
+        async move {
+            let files = self
+                .get_files_in_parent(&parent_id)
+                .await
+                .expect("Unable to get files in drive.");
+            let mut tasks = vec![];
+            let mut tasks2 = vec![];
+            files.into_iter().for_each(|file| {
+                tasks.push(callback(file.clone()));
+
+                if file.mime_type == "application/vnd.google-apps.folder" {
+                    tasks2.push(self.process_folder_recursively(file.id, callback));
+                }
+            });
+
+            for task in tasks {
+                task.await?;
+            }
+
+            for task in tasks2 {
+                task.await?;
+            }
+
+            Ok(())
+        }
+        .boxed_local()
+    }
+
     pub async fn get_start_page_token(&self, drive_id: &str) -> Result<String> {
         Ok(self
             .get_authenticated("/changes/startPageToken")
@@ -173,7 +210,7 @@ impl DriveClient {
                     ("includeItemsFromAllDrives", "true"),
                     ("supportsAllDrives", "true"),
                     ("driveId", drive_id),
-                    ("fields", "nextPageToken, newStartPageToken, changes(type, changeType, time, removed, fileId, file(id, name, mimeType, parents, createdTime, modifiedTime, size))"),
+                    ("fields", "nextPageToken, newStartPageToken, changes(type, changeType, time, removed, fileId, file(id, name, mimeType, parents, createdTime, modifiedTime, size, trashed))"),
                     ("pageSize", &format!("{}", self.config.indexing.fetch_size)),
                 ]).send().await;
 
@@ -199,8 +236,10 @@ impl DriveClient {
         byte_from: u64,
         byte_to: u64,
     ) -> Result<bytes::Bytes> {
+        let request_url = format!("/files/{}", file_id);
+        dbg!(&request_url);
         let mut request =
-            self.get_authenticated_blocking(format!("/files/{}", file_id).as_str())?;
+            self.get_authenticated_blocking(request_url.as_str())?;
         let params = vec![
             ("alt".to_string(), "media".to_string()),
             ("supportsAllDrives".to_string(), "true".to_string()),
@@ -281,61 +320,5 @@ impl DriveClient {
         let drive_list: DriveList = request.query(&params).send().await?.json().await?;
 
         Ok(drive_list.drives)
-    }
-
-    pub async fn process_all_files<'a, F>(&'a self, callback: impl Fn(File) -> F) -> Result<()>
-    where
-        F: Future<Output = Result<()>>,
-    {
-        let drives = self.get_drives().await?;
-        let callback_ref = &callback;
-
-        let mut tasks = vec![];
-        for drive in drives {
-            println!("reading drive {}", &drive.id);
-            tasks.push(self.process_folder_recursively(drive.id.clone(), callback_ref));
-        }
-
-        for task in tasks {
-            task.await?;
-        }
-
-        Ok(())
-    }
-
-    pub(crate) fn process_folder_recursively<'a, F>(
-        &'a self,
-        parent_id: String,
-        callback: &'a impl Fn(File) -> F,
-    ) -> LocalBoxFuture<'a, Result<()>>
-    where
-        F: Future<Output = Result<()>>,
-    {
-        async move {
-            let files = self
-                .get_files_in_parent(&parent_id)
-                .await
-                .expect("Unable to get files in drive.");
-            let mut tasks = vec![];
-            let mut tasks2 = vec![];
-            files.into_iter().for_each(|file| {
-                tasks.push(callback(file.clone()));
-
-                if file.mime_type == "application/vnd.google-apps.folder" {
-                    tasks2.push(self.process_folder_recursively(file.id, callback));
-                }
-            });
-
-            for task in tasks {
-                task.await?;
-            }
-
-            for task in tasks2 {
-                task.await?;
-            }
-
-            Ok(())
-        }
-        .boxed_local()
     }
 }

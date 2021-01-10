@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use dirs::cache_dir;
+use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize, Default, Clone)]
 pub struct Config {
@@ -13,6 +13,8 @@ pub struct IndexingConfig {
     pub batch_size: usize,
     pub fetch_size: usize,
     pub buffer_size: usize,
+    pub batch_flush_interval: u8,
+    pub background_refresh_interval: u8,
 }
 
 impl Default for IndexingConfig {
@@ -21,6 +23,8 @@ impl Default for IndexingConfig {
             batch_size: 512,
             fetch_size: 1000,
             buffer_size: 4096,
+            batch_flush_interval: 10,
+            background_refresh_interval: 30,
         }
     }
 }
@@ -33,7 +37,12 @@ pub struct CacheConfig {
 impl Default for CacheConfig {
     fn default() -> Self {
         CacheConfig {
-            data_path: cache_dir().unwrap().join("StreamDrive").to_str().unwrap().to_string(),
+            data_path: cache_dir()
+                .unwrap()
+                .join("StreamDrive")
+                .to_str()
+                .unwrap()
+                .to_string(),
         }
     }
 }
@@ -41,18 +50,21 @@ impl Default for CacheConfig {
 #[derive(Deserialize, Serialize, Clone)]
 pub struct GeneralConfig {
     pub mount_path: String,
+    pub drive_id: String,
 }
 
 impl Default for GeneralConfig {
     fn default() -> Self {
-        #[cfg(not(any(target_os="linux", target_os="macos")))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         unimplemented!("StreamDrive currently only supports Windows and MacOS");
 
         GeneralConfig {
-            #[cfg(target_os="linux")]
+            #[cfg(target_os = "linux")]
             mount_path: String::from("/media/StreamDrive"),
-            #[cfg(target_os="macos")]
+            #[cfg(target_os = "macos")]
             mount_path: String::from("/Volumes/StreamDrive"),
+
+            drive_id: String::from("root"),
         }
     }
 }
