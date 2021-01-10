@@ -18,6 +18,7 @@ use crate::config::Config;
 lazy_static! {
     static ref SCOPES: [&'static str; 1] = ["https://www.googleapis.com/auth/drive",];
     static ref GDRIVE_BASE_URL: &'static str = "https://www.googleapis.com/drive/v3";
+    static ref GDRIVE_UPLOAD_BASE_URL: &'static str = "https://www.googleapis.com/upload/drive/v3";
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -65,6 +66,15 @@ pub struct File {
     pub mime_type: String,
     pub size: Option<String>,
     pub trashed: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct FileCreateRequest {
+    pub created_time: DateTime<Utc>,
+    pub modified_time: DateTime<Utc>,
+    pub name: String,
+    pub parents: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -140,6 +150,41 @@ impl DriveClient {
             .header(header::AUTHORIZATION, format!("Bearer {}", token)))
     }
 
+    fn post_authenticated_blocking<T>(
+        &self,
+        url: &str,
+        body: &T,
+    ) -> Result<reqwest::blocking::RequestBuilder>
+    where
+        T: Serialize + ?Sized,
+    {
+        let lock = self.token.lock().unwrap();
+        let token = lock.take();
+        lock.set(token.clone());
+
+        Ok(self
+            .blocking_client
+            .post(format!("{}{}", *GDRIVE_BASE_URL, url).as_str())
+            .json(body)
+            .header(header::AUTHORIZATION, format!("Bearer {}", token)))
+    }
+
+    fn upload_authenticated_blocking(
+        &self,
+        url: &str,
+        body: Vec<u8>,
+    ) -> Result<reqwest::blocking::RequestBuilder> {
+        let lock = self.token.lock().unwrap();
+        let token = lock.take();
+        lock.set(token.clone());
+
+        Ok(self
+            .blocking_client
+            .patch(format!("{}{}", *GDRIVE_UPLOAD_BASE_URL, url).as_str())
+            .body(body)
+            .header(header::AUTHORIZATION, format!("Bearer {}", token)))
+    }
+
     fn get_authenticated_blocking(&self, url: &str) -> Result<reqwest::blocking::RequestBuilder> {
         let lock = self.token.lock().unwrap();
         let token = lock.take();
@@ -203,6 +248,38 @@ impl DriveClient {
             .start_page_token)
     }
 
+    pub fn create_file(&self, create_request: FileCreateRequest) -> Result<File> {
+        Ok(self
+            .post_authenticated_blocking("/files", &create_request)?
+            .query(&vec![
+                ("supportsAllDrives", "true"),
+                (
+                    "fields",
+                    "id, name, mimeType, parents, createdTime, modifiedTime, size, trashed",
+                ),
+            ])
+            .send()?
+            .json::<File>()?)
+    }
+
+    pub fn write_file(&self, file_id: &str, data: &[u8]) -> Result<File> {
+        Ok(self
+            .upload_authenticated_blocking(
+                &format!("/files/{}?uploadType=media", file_id),
+                data.to_vec(),
+            )?
+            .query(&vec![
+                ("supportsAllDrives", "true"),
+                (
+                    "fields",
+                    "id, name, mimeType, parents, createdTime, modifiedTime, size, trashed",
+                ),
+            ])
+            .header(header::CONTENT_LENGTH, &format!("{}", data.len()))
+            .send()?
+            .json::<File>()?)
+    }
+
     pub async fn get_change_list(&self, page_token: &str, drive_id: &str) -> Result<ChangeList> {
         let response = self.get_authenticated("/changes").await?
                 .query(&vec![
@@ -238,8 +315,7 @@ impl DriveClient {
     ) -> Result<bytes::Bytes> {
         let request_url = format!("/files/{}", file_id);
         dbg!(&request_url);
-        let mut request =
-            self.get_authenticated_blocking(request_url.as_str())?;
+        let mut request = self.get_authenticated_blocking(request_url.as_str())?;
         let params = vec![
             ("alt".to_string(), "media".to_string()),
             ("supportsAllDrives".to_string(), "true".to_string()),

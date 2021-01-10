@@ -17,12 +17,12 @@ use crate::{
     database::{EntryType, FilesystemEntry, FilesystemRepository, RemoteType},
     drive_client::{Change, ChangeList, DriveClient, File},
 };
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::{
     cell::RefCell,
     io::{Read, Seek, SeekFrom, Write},
 };
-use std::path::PathBuf;
 
 pub(crate) struct IndexWriter {
     publisher: Sender<Change>,
@@ -40,6 +40,10 @@ impl IndexWriter {
 
     pub(crate) fn launch(self) -> (JoinHandle<()>, Sender<Change>) {
         (self.worker.launch(), self.publisher)
+    }
+
+    pub(crate) fn process_create_immediately(file: File, repository: &FilesystemRepository) {
+        IndexWorker::process_create(file, repository);
     }
 }
 
@@ -183,7 +187,7 @@ impl IndexWorker {
             .expect("Unable to execute delete.");
     }
 
-    fn process_create(file: File, repository: &FilesystemRepository) {
+    pub fn process_create(file: File, repository: &FilesystemRepository) {
         let remote_id = file.id;
         let parent_id = file.parents.first().map(|item| item.clone());
 

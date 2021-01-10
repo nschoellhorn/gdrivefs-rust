@@ -85,13 +85,7 @@ async fn main() -> Result<()> {
     let shared_drives_inode = create_shared_drives(&repository, root_inode);
     let my_drives_inode = create_my_drives(&repository, root_inode);
 
-    let filesystem = GdriveFs::new(
-        Arc::clone(&repository),
-        Arc::clone(&drive_client),
-        root_inode,
-        shared_drives_inode,
-        my_drives_inode,
-    );
+    let filesystem = GdriveFs::new(Arc::clone(&repository), Arc::clone(&drive_client));
 
     log::info!("Starting indexing.");
 

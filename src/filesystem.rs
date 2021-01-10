@@ -1,19 +1,18 @@
-use crate::database::{EntryType, FilesystemEntry, FilesystemRepository};
 use crate::drive_client::DriveClient;
-use crate::drive_client::File;
-use chrono::{DateTime, NaiveDateTime};
-use diesel::dsl::exists;
-use diesel::prelude::*;
-use diesel::{select, SqliteConnection};
-use fuse::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyOpen, ReplyStatfs, Request,
+use crate::{
+    database::{EntryType, FilesystemEntry, FilesystemRepository},
+    drive_client::FileCreateRequest,
+    indexing::IndexWriter,
 };
-use libc::{EIO, ENOENT};
-use std::boxed::Box;
+use anyhow::Result;
+use chrono::Utc;
+use fuse::{
+    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, ReplyWrite, Request,
+};
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::ops::Add;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -69,27 +68,20 @@ pub(crate) struct GdriveFs {
     file_handles: Mutex<HashMap<u64, String>>,
     latest_file_handle: Mutex<Cell<u64>>,
     drive_client: Arc<DriveClient>,
-    root_inode: u64,
-    shared_drives_inode: u64,
-    my_drives_inode: u64,
+    pending_writes: HashMap<u64, Vec<u8>>,
 }
 
 impl GdriveFs {
     pub(crate) fn new(
         repository: Arc<FilesystemRepository>,
         drive_client: Arc<DriveClient>,
-        root_inode: u64,
-        shared_drives_inode: u64,
-        my_drives_inode: u64,
     ) -> Self {
         Self {
             repository,
             file_handles: Mutex::new(HashMap::new()),
             latest_file_handle: Mutex::new(Cell::new(0)),
             drive_client,
-            root_inode,
-            shared_drives_inode,
-            my_drives_inode,
+            pending_writes: HashMap::new(),
         }
     }
 
@@ -114,20 +106,24 @@ impl GdriveFs {
 
         fh
     }
+
+    fn flush_handle(&mut self, handle: u64) -> Result<()> {
+        match self.pending_writes.remove(&handle) {
+            Some(data) => {
+                log::info!("Flushing data to Google.");
+
+                let guard = self.file_handles.lock().unwrap();
+                let file_id = guard.get(&handle).unwrap();
+                self.drive_client.write_file(file_id, data.as_slice())?;
+
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
 }
 
 impl Filesystem for GdriveFs {
-    /*fn opendir(&mut self, request: &Request, inode: u64, flags: u32, reply: ReplyOpen) {
-        println!(r#"
-        Call: opendir()
-        Request: {:?}
-        Inode: {}
-        Flags: {}
-        "#, request, inode, flags);
-
-        reply.error(ENOENT);
-    }*/
-
     fn lookup(
         &mut self,
         _request: &Request,
@@ -141,7 +137,7 @@ impl Filesystem for GdriveFs {
             .find_entry_as_child(parent_inode as i64, entry_name);
         match entry {
             Some(fs_entry) => reply.entry(&TTL, &get_attr(&fs_entry), 0),
-            None => reply.error(ENOENT),
+            None => reply.error(libc::ENOENT),
         }
     }
 
@@ -162,18 +158,200 @@ impl Filesystem for GdriveFs {
                             request, inode
                         );
 
-                        reply.error(ENOENT)
+                        reply.error(libc::ENOENT)
                     }
                 }
             }
         }
     }
 
+    fn fsync(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        log::info!("fsync() being called for inode {}", _ino);
+
+        if self.pending_writes.contains_key(&_fh) {
+            match self.flush_handle(_fh) {
+                Ok(_) => reply.ok(),
+                Err(_) => reply.error(libc::EIO),
+            }
+
+            return;
+        }
+
+        reply.ok();
+    }
+
+    fn release(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _flags: u32,
+        _lock_owner: u64,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        log::info!("release() being called for inode {}", _ino);
+
+        if self.pending_writes.contains_key(&_fh) {
+            log::info!("Pending writes detected, flushing.");
+            match self.flush_handle(_fh) {
+                Ok(_) => {
+                    log::info!("Successfully flushed pending data.");
+
+                    reply.ok();
+                }
+                Err(error) => {
+                    log::error!("I/O error while flushing: {:?}", error);
+
+                    reply.error(libc::EIO);
+                }
+            }
+
+            return;
+        }
+
+        let mut guard = self.file_handles.lock().unwrap();
+        guard.remove(&_fh);
+
+        reply.ok();
+    }
+
+    fn create(
+        &mut self,
+        _req: &Request<'_>,
+        parent_inode: u64,
+        file_name: &OsStr,
+        _mode: u32,
+        _flags: u32,
+        reply: ReplyCreate,
+    ) {
+        let parent_directory = self.repository.find_entry_for_inode(parent_inode);
+
+        if parent_directory.is_none() {
+            reply.error(libc::ENOENT);
+            return;
+        }
+
+        let parent_directory = parent_directory.unwrap();
+        if parent_directory.entry_type == EntryType::File {
+            reply.error(libc::ENOTDIR);
+            return;
+        }
+
+        if self
+            .repository
+            .find_entry_as_child(parent_inode as i64, file_name)
+            .is_some()
+        {
+            reply.error(libc::EEXIST);
+            return;
+        }
+
+        let current_time = Utc::now();
+        let create_response = self.drive_client.create_file(FileCreateRequest {
+            created_time: current_time.clone(),
+            modified_time: current_time,
+            name: file_name.to_str().unwrap().to_string(),
+            parents: vec![parent_directory.id],
+        });
+
+        match create_response {
+            Ok(file) => {
+                // TODO: Improve error handling
+                let remote_id = file.id.clone();
+                IndexWriter::process_create_immediately(file, &self.repository);
+
+                let cache_entry = self
+                    .repository
+                    .find_entry_by_id(&remote_id)
+                    .expect("Freshly created entry is missing. That sucks.");
+                let attr = get_attr(&cache_entry);
+                let handle = self.make_file_handle(remote_id);
+
+                reply.created(&TTL, &attr, 1, handle, _flags);
+            }
+            Err(err) => {
+                log::error!("Unexpected API error while creating a file: {:?}", err);
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn write(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _offset: i64,
+        _data: &[u8],
+        _flags: u32,
+        reply: ReplyWrite,
+    ) {
+        // We are limited by the backing Vec<> of pending changes here
+        if (_offset as usize + _data.len()) > usize::MAX {
+            reply.error(libc::E2BIG);
+            return;
+        }
+
+        let mut pending_data = self.pending_writes.remove(&_fh).unwrap_or(Vec::new());
+
+        let write_index = _offset as usize;
+        _data
+            .iter()
+            .cloned()
+            .enumerate()
+            .for_each(|(data_index, byte)| {
+                if write_index + data_index >= pending_data.len() {
+                    pending_data.push(byte);
+                } else {
+                    pending_data[write_index + data_index] = byte;
+                }
+            });
+
+        self.pending_writes.insert(_fh, pending_data);
+
+        reply.written(_data.len() as u32);
+    }
+
+    fn setattr(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        _size: Option<u64>,
+        _atime: Option<SystemTime>,
+        _mtime: Option<SystemTime>,
+        _fh: Option<u64>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        let entry = self.repository.find_entry_for_inode(_ino);
+
+        if entry.is_none() {
+            reply.error(libc::ENOENT);
+            return;
+        }
+
+        reply.attr(&TTL, &get_attr(&entry.unwrap()));
+    }
+
     fn open(&mut self, _req: &Request, _ino: u64, _flags: u32, reply: ReplyOpen) {
         let fs_entry = self.repository.find_entry_for_inode(_ino);
 
         if fs_entry.is_none() {
-            reply.error(ENOENT);
+            reply.error(libc::ENOENT);
             return;
         }
 
@@ -194,7 +372,7 @@ impl Filesystem for GdriveFs {
         let remote_id = lock.get(&_fh);
 
         if remote_id.is_none() {
-            reply.error(ENOENT);
+            reply.error(libc::ENOENT);
             return;
         }
 
@@ -204,15 +382,30 @@ impl Filesystem for GdriveFs {
             "READ CALLED - Offset: {}, Size: {}, Inode: {}",
             _offset, _size, _ino
         );
+
+        // TODO: handle possible race condition when the file gets deleted on the remote side. In that case
+        // we wouldn't know and still have an active file handle which could lead to a lot of problems.
+        let file_entry = self.repository.find_entry_by_id(&remote_id).unwrap();
+
+        if file_entry.size == 0 {
+            reply.data(&[]);
+            return;
+        }
+
+        dbg!(
+            _offset as u64,
+            std::cmp::min(_offset + _size as i64, file_entry.size) as u64 - 1
+        );
+
         let client = Arc::clone(&self.drive_client);
         let data = client.get_file_content(
             remote_id.as_str(),
             _offset as u64,
-            (_offset + _size as i64) as u64 - 1,
+            std::cmp::min(_offset + _size as i64, file_entry.size) as u64 - 1,
         );
 
         if let Err(_) = data {
-            reply.error(EIO);
+            reply.error(libc::EIO);
             return;
         }
 
@@ -281,7 +474,7 @@ impl Filesystem for GdriveFs {
                 request, inode, file_handle, offset
             );
 
-            reply.error(ENOENT);
+            reply.error(libc::ENOENT);
         }
     }
 }

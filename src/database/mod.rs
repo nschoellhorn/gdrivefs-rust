@@ -9,7 +9,7 @@ use diesel::r2d2::{ConnectionManager, Pool};
 use diesel::{select, SqliteConnection};
 use diesel_derive_enum::DbEnum;
 
-use crate::database::schema::filesystem;
+use crate::{database::schema::filesystem, drive_client::File};
 use crate::database::schema::filesystem::dsl::*;
 
 pub(crate) mod connection;
@@ -174,6 +174,13 @@ impl FilesystemRepository {
                 "Unable to insert new entry: {}#{}",
                 fs_entry.name, fs_entry.id
             ));
+    }
+
+    pub(crate) fn find_entry_by_id(&self, rid: &str) -> Option<FilesystemEntry> {
+        filesystem.filter(id.eq(rid))
+            .first::<FilesystemEntry>(&self.connection.get().unwrap())
+            .optional()
+            .unwrap()
     }
 
     pub(crate) fn set_parent_inode_by_parent_id(&self, p_id: &str, p_inode: i64) -> Result<usize> {
