@@ -116,17 +116,18 @@ impl IndexWorker {
 
     async fn worker_loop(&mut self) {
         while let Some(change) = self.receiver.recv().await {
-            let batch = self.batch.lock().await;
-
-            {
+            let changes_length = {
+                let batch = self.batch.lock().await;
                 let mut mut_batch = batch.borrow_mut();
 
                 mut_batch.changes.push(change);
                 mut_batch.latest_change_received = Some(Utc::now());
-            }
+
+                mut_batch.changes.len()
+            };
 
             // We collect a batch of 1000 changes and execute all of them in one transaction
-            if (*batch).borrow().changes.len() == self.config.indexing.batch_size {
+            if changes_length == self.config.indexing.batch_size {
                 Self::flush(
                     Arc::clone(&self.batch),
                     &self.repository,
