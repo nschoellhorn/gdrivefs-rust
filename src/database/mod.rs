@@ -9,8 +9,8 @@ use diesel::r2d2::{ConnectionManager, Pool};
 use diesel::{select, SqliteConnection};
 use diesel_derive_enum::DbEnum;
 
-use crate::{database::schema::filesystem, drive_client::File};
 use crate::database::schema::filesystem::dsl::*;
+use crate::{database::schema::filesystem, drive_client::File};
 
 pub(crate) mod connection;
 mod schema;
@@ -125,6 +125,17 @@ impl FilesystemRepository {
         .map(|entry| entry.inode)
     }
 
+    pub(crate) fn update_entry_by_inode(
+        &self,
+        current_inode: i64,
+        new_size: i64,
+        parent_remote_id: Option<String>,
+    ) -> Result<usize> {
+        Ok(diesel::update(filesystem.filter(inode.eq(current_inode)))
+            .set((size.eq(new_size), parent_id.eq(parent_remote_id)))
+            .execute(&self.connection.get().unwrap())?)
+    }
+
     pub(crate) fn find_entry_as_child(
         &self,
         parent_i: i64,
@@ -177,7 +188,8 @@ impl FilesystemRepository {
     }
 
     pub(crate) fn find_entry_by_id(&self, rid: &str) -> Option<FilesystemEntry> {
-        filesystem.filter(id.eq(rid))
+        filesystem
+            .filter(id.eq(rid))
             .first::<FilesystemEntry>(&self.connection.get().unwrap())
             .optional()
             .unwrap()

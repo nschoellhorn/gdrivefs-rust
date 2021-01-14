@@ -43,7 +43,7 @@ impl IndexWriter {
     }
 
     pub(crate) fn process_create_immediately(file: File, repository: &FilesystemRepository) {
-        IndexWorker::process_create(file, repository);
+        IndexWorker::process_update(file, repository);
     }
 }
 
@@ -178,7 +178,7 @@ impl IndexWorker {
         if change.removed || change.file.is_some() && change.file.clone().unwrap().trashed {
             Self::process_delete(change.fileId.unwrap(), repository);
         } else {
-            Self::process_create(change.file.unwrap(), repository);
+            Self::process_update(change.file.unwrap(), repository);
         }
     }
 
@@ -188,7 +188,7 @@ impl IndexWorker {
             .expect("Unable to execute delete.");
     }
 
-    pub fn process_create(file: File, repository: &FilesystemRepository) {
+    pub fn process_update(file: File, repository: &FilesystemRepository) {
         let remote_id = file.id;
         let parent_id = file.parents.first().map(|item| item.clone());
 
@@ -198,38 +198,55 @@ impl IndexWorker {
             None
         };
 
-        if let None = repository.find_inode_by_remote_id(remote_id.as_str()) {
-            // First, we create the new entry itself
-            let inode = repository.get_largest_inode() + 1;
-            repository.create_entry(&FilesystemEntry {
-                inode,
-                parent_id: parent_id,
-                name: file.name,
-                entry_type: match file.mime_type.as_str() {
-                    "application/vnd.google-apps.folder" => EntryType::Directory,
-                    _ => EntryType::File,
-                },
-                created_at: file.created_time.naive_local(),
-                last_modified_at: file.modified_time.naive_local(),
-                remote_type: Some(match file.mime_type.as_str() {
-                    "application/vnd.google-apps.folder" => RemoteType::Directory,
-                    _ => RemoteType::File,
-                }),
-                id: remote_id.clone(),
-                size: file
-                    .size
-                    .unwrap_or("0".to_string())
-                    .as_str()
-                    .parse()
-                    .unwrap_or(0),
-                parent_inode,
-            });
+        match repository.find_inode_by_remote_id(remote_id.as_str()) {
+            Some(inode) => {
+                // Update the existing entry. For now, we just update the size and parent.
+                match repository.update_entry_by_inode(
+                    inode,
+                    file.size
+                        .unwrap_or("0".to_string())
+                        .as_str()
+                        .parse()
+                        .unwrap_or(0),
+                    parent_id,
+                ) {
+                    Ok(_) => (),
+                    Err(err) => log::warn!("Unable to process update: {:?}", err)
+                }
+            }
+            None => {
+                // First, we create the new entry itself
+                let inode = repository.get_largest_inode() + 1;
+                repository.create_entry(&FilesystemEntry {
+                    inode,
+                    parent_id: parent_id,
+                    name: file.name,
+                    entry_type: match file.mime_type.as_str() {
+                        "application/vnd.google-apps.folder" => EntryType::Directory,
+                        _ => EntryType::File,
+                    },
+                    created_at: file.created_time.naive_local(),
+                    last_modified_at: file.modified_time.naive_local(),
+                    remote_type: Some(match file.mime_type.as_str() {
+                        "application/vnd.google-apps.folder" => RemoteType::Directory,
+                        _ => RemoteType::File,
+                    }),
+                    id: remote_id.clone(),
+                    size: file
+                        .size
+                        .unwrap_or("0".to_string())
+                        .as_str()
+                        .parse()
+                        .unwrap_or(0),
+                    parent_inode,
+                });
 
-            // but then, we also update all entries that have the current remote id as the parent remote
-            // to make sure they know about their parent inode as well
-            repository
-                .set_parent_inode_by_parent_id(&remote_id, inode)
-                .expect("Failed to update parent inodes");
+                // but then, we also update all entries that have the current remote id as the parent remote
+                // to make sure they know about their parent inode as well
+                repository
+                    .set_parent_inode_by_parent_id(&remote_id, inode)
+                    .expect("Failed to update parent inodes");
+            }
         }
     }
 }
