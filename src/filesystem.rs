@@ -1,6 +1,7 @@
 use crate::drive_client::DriveClient;
 use crate::{
-    database::{EntryType, FilesystemEntry, FilesystemRepository},
+    database::entity::{EntryType, FilesystemEntry},
+    database::filesystem::FilesystemRepository,
     drive_client::FileCreateRequest,
     indexing::IndexWriter,
 };

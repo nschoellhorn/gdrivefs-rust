@@ -4,6 +4,5 @@ clientCredentials.json
 tokencache.json
 filesystem.db*
 .vscode/
-state.txt
 flamegraph.svg
 cargo-flamegraph.stacks

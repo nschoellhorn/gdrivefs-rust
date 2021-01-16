@@ -1,3 +1,5 @@
+#![feature(async_closure)]
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use diesel::{
@@ -12,20 +14,28 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::config::Config;
 use crate::{
-    database::{EntryType, FilesystemEntry, FilesystemRepository, RemoteType},
+    config::Config,
+    database::{entity::IndexState, index_state::IndexStateRepository},
+};
+use crate::{
+    database::entity::{EntryType, FilesystemEntry, RemoteType},
+    database::filesystem::FilesystemRepository,
     drive_client::{Change, ChangeList, DriveClient, File},
 };
-use std::path::PathBuf;
+use core::panic;
+use std::cell::RefCell;
 use std::sync::Arc;
-use std::{
-    cell::RefCell,
-    io::{Read, Seek, SeekFrom, Write},
-};
+
+#[derive(Debug)]
+pub(crate) enum IndexChange {
+    RemoteChange(Change),
+    FileCreate(FilesystemEntry),
+    InstantChange(Box<IndexChange>),
+}
 
 pub(crate) struct IndexWriter {
-    publisher: Sender<Change>,
+    publisher: Sender<IndexChange>,
     worker: IndexWorker,
 }
 
@@ -38,7 +48,7 @@ impl IndexWriter {
         }
     }
 
-    pub(crate) fn launch(self) -> (JoinHandle<()>, Sender<Change>) {
+    pub(crate) fn launch(self) -> (JoinHandle<()>, Sender<IndexChange>) {
         (self.worker.launch(), self.publisher)
     }
 
@@ -48,19 +58,23 @@ impl IndexWriter {
 }
 
 struct ChangeBatch {
-    changes: Vec<Change>,
+    changes: Vec<IndexChange>,
     latest_change_received: Option<DateTime<Utc>>,
 }
 
 struct IndexWorker {
-    receiver: Receiver<Change>,
+    receiver: Receiver<IndexChange>,
     repository: FilesystemRepository,
     config: Config,
     batch: Arc<Mutex<RefCell<ChangeBatch>>>,
 }
 
 impl IndexWorker {
-    fn new(receiver: Receiver<Change>, repository: FilesystemRepository, config: Config) -> Self {
+    fn new(
+        receiver: Receiver<IndexChange>,
+        repository: FilesystemRepository,
+        config: Config,
+    ) -> Self {
         IndexWorker {
             receiver,
             repository,
@@ -116,6 +130,12 @@ impl IndexWorker {
 
     async fn worker_loop(&mut self) {
         while let Some(change) = self.receiver.recv().await {
+            if let IndexChange::InstantChange(actual_change) = change {
+                // If the change type is InstantChange, we want to process it instantly instead of batching it.
+                Self::process_change(*actual_change, &self.repository);
+                continue;
+            }
+
             let changes_length = {
                 let batch = self.batch.lock().await;
                 let mut mut_batch = batch.borrow_mut();
@@ -167,18 +187,35 @@ impl IndexWorker {
             batch
                 .changes
                 .into_iter()
-                .filter(|change| change.r#type == "file")
+                .filter(|change| match change {
+                    IndexChange::FileCreate(_) | IndexChange::InstantChange(_) => true,
+                    IndexChange::RemoteChange(remote_change) => remote_change.r#type == "file",
+                })
                 .for_each(|change| Self::process_change(change, repository));
 
             Ok(())
         })
     }
 
-    fn process_change(change: Change, repository: &FilesystemRepository) {
-        if change.removed || change.file.is_some() && change.file.clone().unwrap().trashed {
-            Self::process_delete(change.fileId.unwrap(), repository);
-        } else {
-            Self::process_update(change.file.unwrap(), repository);
+    fn process_change(change: IndexChange, repository: &FilesystemRepository) {
+        match change {
+            IndexChange::RemoteChange(change) => {
+                if change.removed || change.file.is_some() && change.file.clone().unwrap().trashed {
+                    Self::process_delete(change.fileId.unwrap(), repository);
+                } else {
+                    Self::process_update(change.file.unwrap(), repository);
+                }
+            }
+            IndexChange::FileCreate(mut file) => {
+                file.inode = repository.get_largest_inode() + 1;
+                repository.create_entry(&file);
+            }
+            IndexChange::InstantChange(actual_change) => {
+                if let IndexChange::InstantChange(_) = actual_change.as_ref() {
+                    // This could probably lead to recursion and should not be the case, so break out of it - better safe than sorry.
+                    panic!("Logical flaw detected. InstantChange contains InstantChange.");
+                }
+            }
         }
     }
 
@@ -211,7 +248,7 @@ impl IndexWorker {
                     parent_id,
                 ) {
                     Ok(_) => (),
-                    Err(err) => log::warn!("Unable to process update: {:?}", err)
+                    Err(err) => log::warn!("Unable to process update: {:?}", err),
                 }
             }
             None => {
@@ -219,7 +256,7 @@ impl IndexWorker {
                 let inode = repository.get_largest_inode() + 1;
                 repository.create_entry(&FilesystemEntry {
                     inode,
-                    parent_id: parent_id,
+                    parent_id,
                     name: file.name,
                     entry_type: match file.mime_type.as_str() {
                         "application/vnd.google-apps.folder" => EntryType::Directory,
@@ -265,13 +302,12 @@ impl IndexFetcher {
 
 pub struct DriveIndex {
     drive_client: Arc<DriveClient>,
-    change_publisher: Sender<Change>,
+    change_publisher: Sender<IndexChange>,
     writer_handle: JoinHandle<()>,
-    current_change_token: String,
-    repository: FilesystemRepository,
+    fs_repository: FilesystemRepository,
     shared_drives_inode: u64,
     config: Config,
-    state_file_name: PathBuf,
+    state_repository: IndexStateRepository,
 }
 
 impl DriveIndex {
@@ -280,39 +316,28 @@ impl DriveIndex {
         pool: Pool<ConnectionManager<SqliteConnection>>,
         config: Config,
         shared_drives_inode: u64,
-        state_file_name: PathBuf,
     ) -> Self {
         let (handle, publisher) = IndexWriter::new(pool.clone(), config.clone()).launch();
-
-        let mut state_file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .read(true)
-            .open(&state_file_name)
-            .expect("Unable to read current change token.");
-
-        let mut current_token = String::new();
-        state_file
-            .read_to_string(&mut current_token)
-            .expect("Unable to read current change token.");
 
         Self {
             drive_client,
             change_publisher: publisher,
             writer_handle: handle,
-            repository: FilesystemRepository::new(pool),
+            fs_repository: FilesystemRepository::new(pool.clone()),
             shared_drives_inode,
             config,
-            state_file_name,
-            current_change_token: current_token,
+            state_repository: IndexStateRepository::new(pool),
         }
     }
 
     pub async fn refresh_full(&mut self) -> Result<()> {
         log::info!("Starting full index refresh.");
 
-        self.current_change_token = String::from("1");
-        self.process_pending_changes().await?;
+        self.state_repository.reset_all()?;
+
+        for state in self.state_repository.get_all_states().into_iter() {
+            self.process_pending_changes(state).await?;
+        }
 
         log::info!("Full index refresh finished.");
 
@@ -328,36 +353,20 @@ impl DriveIndex {
                 interval.tick().await;
                 log::info!("Fetching new changes from Google Drive");
 
-                self.process_pending_changes()
-                    .await
-                    .expect("Background indexing tick failed.");
+                for state in self.state_repository.get_all_states().into_iter() {
+                    self.process_pending_changes(state)
+                        .await
+                        .expect("Background indexing tick failed.");
+                }
             }
         })
     }
 
-    async fn process_pending_changes(&mut self) -> Result<()> {
+    async fn process_pending_changes(&mut self, index_state: IndexState) -> Result<()> {
         let mut has_more = true;
-        let drive_id = self.config.general.drive_id.as_str();
+        let drive_id = index_state.drive_id.as_str();
 
-        let mut state_file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .read(true)
-            .open(&self.state_file_name)?;
-
-        let mut current_token = String::new();
-        state_file.read_to_string(&mut current_token)?;
-
-        let mut state_file = std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&self.state_file_name)?;
-
-        current_token = current_token.trim().to_string();
-
-        if current_token.is_empty() {
-            current_token = "1".to_string();
-        }
+        let mut current_token = index_state.page_token.to_string();
 
         while has_more {
             let current_token_str = current_token.as_str();
@@ -383,32 +392,27 @@ impl DriveIndex {
             let next_page_token = change_list.next_page_token.clone();
 
             for change in change_list.changes.into_iter() {
-                println!("Sending change");
-                self.change_publisher.send(change).await?;
+                log::trace!("Sending change from [process_pending_changes()] to [worker_loop()]");
+                self.change_publisher
+                    .send(IndexChange::RemoteChange(change))
+                    .await?;
             }
 
             has_more = next_page_token.is_some();
             if has_more {
                 current_token = next_page_token.unwrap();
-                state_file
-                    .write_all(current_token.as_bytes())
-                    .expect("Unable to write new state to file");
-            } else {
-                state_file
-                    .write_all(
-                        start_page_token
-                            .expect(
-                                "Next Start Page Token Not Found, this seems like an logic bug.",
-                            )
-                            .as_bytes(),
-                    )
-                    .expect("Unable to write new state to file");
-            }
 
-            state_file.flush().expect("Unable to flush state file");
-            state_file
-                .seek(SeekFrom::Start(0))
-                .expect("Failed to reset write pointer to start of file.");
+                // TODO: This needs to change because we can't be sure yet, that the changes from the last page really have been saved.
+                let _ = self
+                    .state_repository
+                    .update_token_for_drive(drive_id, &current_token);
+            } else {
+                let _ = self.state_repository.update_token_for_drive(
+                    drive_id,
+                    &start_page_token
+                        .expect("Next Start Page Token Not Found, this seems like an logic bug."),
+                );
+            }
         }
 
         Ok(())
@@ -421,48 +425,45 @@ impl DriveIndex {
             .iter()
             .map(|drive| drive.id.clone())
             .collect::<Vec<_>>();
-        let known_drive_ids = self.repository.get_all_drive_ids();
+        let known_drive_ids = self.fs_repository.get_all_drive_ids();
 
         dbg!(&known_drive_ids, &accessible_drive_ids);
 
-        self.repository.transaction::<_, anyhow::Error, _>(|| {
-            // Remove all known drives (from db) that we don't find in the received list (from google) anymore
-            known_drive_ids
-                .iter()
-                .filter(|drive_id| !accessible_drive_ids.contains(drive_id))
-                .for_each(|drive_id| {
-                    self.repository
-                        .remove_entry_by_remote_id(drive_id)
-                        .expect("Failed to remove entry")
-                });
+        // Remove all known drives (from db) that we don't find in the received list (from google) anymore
+        known_drive_ids
+            .iter()
+            .filter(|drive_id| !accessible_drive_ids.contains(drive_id))
+            .for_each(|drive_id| {
+                self.fs_repository
+                    .remove_entry_by_remote_id(drive_id)
+                    .expect("Failed to remove entry")
+            });
 
-            // add all drives that we currently don't know about
-            drives
-                .into_iter()
-                .filter(|drive| !known_drive_ids.contains(&drive.id))
-                .for_each(|drive| {
-                    let inode = self.repository.get_largest_inode() + 1;
+        // add all drives that we currently don't know about
+        for drive in drives
+            .into_iter()
+            .filter(|drive| !known_drive_ids.contains(&drive.id))
+        {
+            // We can just silently fail here
+            let _ = self.state_repository.init_state(&drive.id);
 
-                    // TODO: This should probably go through the index writer instead, but it currently accepts only stuff of type "Change"
-                    //  Maybe we could introduce some ADT "Change" which contains DriveChange and FileChange or something like that.
-                    self.repository.create_entry(&FilesystemEntry {
-                        id: drive.id.clone(),
-                        parent_id: Some("shared_drives".to_string()),
-                        name: drive.name.clone(),
-                        entry_type: EntryType::Drive,
-                        created_at: drive.created_time.naive_local(),
-                        last_modified_at: drive.created_time.naive_local(),
-                        remote_type: Some(RemoteType::TeamDrive),
-                        inode: self.repository.get_largest_inode() + 1,
-                        size: 0,
-                        parent_inode: Some(self.shared_drives_inode as i64),
-                        last_accessed_at: drive.created_time.naive_local(),
-                        mode: 0o700,
-                    });
-                });
-
-            Ok(())
-        })?;
+            self.change_publisher
+                .send(IndexChange::FileCreate(FilesystemEntry {
+                    id: drive.id.clone(),
+                    parent_id: Some("shared_drives".to_string()),
+                    name: drive.name.clone(),
+                    entry_type: EntryType::Drive,
+                    created_at: drive.created_time.naive_local(),
+                    last_modified_at: drive.created_time.naive_local(),
+                    remote_type: Some(RemoteType::TeamDrive),
+                    inode: -1, // This gets overwritten by the worker to make sure we always get the latest inode
+                    size: 0,
+                    parent_inode: Some(self.shared_drives_inode as i64),
+                    last_accessed_at: drive.created_time.naive_local(),
+                    mode: 0o700,
+                }))
+                .await?;
+        }
 
         Ok(())
     }

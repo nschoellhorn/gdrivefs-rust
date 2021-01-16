@@ -1,6 +1,6 @@
 table! {
-    use crate::database::EntryTypeMapping;
-    use crate::database::RemoteTypeMapping;
+    use crate::database::entity::EntryTypeMapping;
+    use crate::database::entity::RemoteTypeMapping;
     use diesel::sql_types::*;
 
     filesystem (id) {
@@ -9,12 +9,21 @@ table! {
         entry_type -> EntryTypeMapping,
         created_at -> Timestamp,
         last_modified_at -> Timestamp,
+        last_accessed_at -> Timestamp,
+        mode -> Integer,
         remote_type -> Nullable<RemoteTypeMapping>,
         inode -> BigInt,
         size -> BigInt,
         parent_id -> Nullable<Text>,
         parent_inode -> Nullable<BigInt>,
-        last_accessed_at -> Timestamp,
-        mode -> Integer,
+    }
+}
+
+table! {
+    use diesel::sql_types::*;
+
+    index_state (drive_id) {
+        drive_id -> Text,
+        page_token -> BigInt,
     }
 }
