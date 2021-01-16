@@ -43,6 +43,8 @@ pub struct FilesystemEntry {
     pub size: i64,
     pub parent_id: Option<String>,
     pub parent_inode: Option<i64>,
+    pub last_accessed_at: NaiveDateTime,
+    pub mode: i32,
 }
 
 #[derive(Clone)]
@@ -62,6 +64,30 @@ impl FilesystemRepository {
             .unwrap();
 
         largest_inode.unwrap_or(0)
+    }
+
+    pub(crate) fn update_mode_by_inode(&self, ino: i64, new_mode: i32) -> Result<usize> {
+        Ok(diesel::update(filesystem.filter(inode.eq(ino)))
+            .set(mode.eq(new_mode))
+            .execute(&self.connection.get().unwrap())?)
+    }
+
+    pub(crate) fn update_size_by_inode(&self, ino: i64, new_size: i64) -> Result<usize> {
+        Ok(diesel::update(filesystem.filter(inode.eq(ino)))
+            .set(size.eq(new_size))
+            .execute(&self.connection.get().unwrap())?)
+    }
+
+    pub(crate) fn update_last_access_by_inode(&self, ino: i64, access_time: NaiveDateTime) -> Result<usize> {
+        Ok(diesel::update(filesystem.filter(inode.eq(ino)))
+            .set(last_accessed_at.eq(access_time))
+            .execute(&self.connection.get().unwrap())?)
+    }
+
+    pub(crate) fn update_last_modification_by_inode(&self, ino: i64, modification_time: NaiveDateTime) -> Result<usize> {
+        Ok(diesel::update(filesystem.filter(inode.eq(ino)))
+            .set(last_modified_at.eq(modification_time))
+            .execute(&self.connection.get().unwrap())?)
     }
 
     pub(crate) fn transaction<T, E, F>(&self, f: F) -> Result<T, E>

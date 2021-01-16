@@ -5,11 +5,13 @@ use crate::{
     indexing::IndexWriter,
 };
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{NaiveDateTime, Utc};
+use diesel::update;
 use fuse::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
+use libc::{S_IRWXG, S_ISUID};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -18,27 +20,13 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const ROOT_DIR_ATTR: FileAttr = FileAttr {
-    ino: 1,
-    size: 0,
-    blocks: 0,
-    atime: UNIX_EPOCH,
-    mtime: UNIX_EPOCH,
-    ctime: UNIX_EPOCH,
-    crtime: UNIX_EPOCH,
-    kind: FileType::Directory,
-    perm: 0o755,
-    nlink: 2,
-    uid: 1000,
-    gid: 1000,
-    rdev: 0,
-    flags: 0,
-};
-
 fn get_attr(entry: &FilesystemEntry) -> FileAttr {
     let created = UNIX_EPOCH.add(Duration::from_secs(entry.created_at.timestamp() as u64));
     let modified = UNIX_EPOCH.add(Duration::from_secs(
         entry.last_modified_at.timestamp() as u64
+    ));
+    let accessed = UNIX_EPOCH.add(Duration::from_secs(
+        entry.last_accessed_at.timestamp() as u64
     ));
 
     let kind = GdriveFs::entry_type_to_file_type(&entry.entry_type);
@@ -47,13 +35,13 @@ fn get_attr(entry: &FilesystemEntry) -> FileAttr {
         ino: entry.inode as u64,
         size: entry.size as u64,
         blocks: 0,
-        atime: created, // 1970-01-01 00:00:00
+        atime: accessed, // 1970-01-01 00:00:00
         mtime: modified,
         ctime: modified,
         crtime: created,
         kind,
-        perm: 0o700,
-        nlink: 2,
+        perm: entry.mode as u16,
+        nlink: 0,
         uid: 1000, // TODO: which user id do we wanna use? Just the current user?
         gid: 1000, // TODO: which group id do we wanna use? Just the current group?
         rdev: 0,
@@ -142,25 +130,20 @@ impl Filesystem for GdriveFs {
     }
 
     fn getattr(&mut self, request: &Request, inode: u64, reply: ReplyAttr) {
-        match inode {
-            1 => reply.attr(&TTL, &ROOT_DIR_ATTR),
-            _ => {
-                let entry = self.repository.find_entry_for_inode(inode);
-                match entry {
-                    Some(fs_entry) => reply.attr(&TTL, &get_attr(&fs_entry)),
-                    None => {
-                        println!(
-                            r#"
+        let entry = self.repository.find_entry_for_inode(inode);
+        match entry {
+            Some(fs_entry) => reply.attr(&TTL, &get_attr(&fs_entry)),
+            None => {
+                println!(
+                    r#"
                             Call Errored: getattr()
                             Request: {:?}
                             Inode: {}
                             "#,
-                            request, inode
-                        );
+                    request, inode
+                );
 
-                        reply.error(libc::ENOENT)
-                    }
-                }
+                reply.error(libc::ENOENT)
             }
         }
     }
@@ -323,13 +306,13 @@ impl Filesystem for GdriveFs {
     fn setattr(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
-        _mode: Option<u32>,
+        ino: u64,
+        mode: Option<u32>,
         _uid: Option<u32>,
         _gid: Option<u32>,
-        _size: Option<u64>,
-        _atime: Option<SystemTime>,
-        _mtime: Option<SystemTime>,
+        size: Option<u64>,
+        atime: Option<SystemTime>,
+        mtime: Option<SystemTime>,
         _fh: Option<u64>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
@@ -337,12 +320,63 @@ impl Filesystem for GdriveFs {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        let entry = self.repository.find_entry_for_inode(_ino);
+        // TODO: Figure out if it's smart to just swallow changes that we don't support or if it would be better to return something like ENOSYS
+        //  not sure yet, whether ENOSYS would cause more problems than it would fix, so let's keep it like this for now.
+
+        let entry = self.repository.find_entry_for_inode(ino);
 
         if entry.is_none() {
             reply.error(libc::ENOENT);
             return;
         }
+
+        let update_result = self.repository.transaction::<_, anyhow::Error, _>(|| {
+            if let Some(mode) = mode {
+                self.repository
+                    .update_mode_by_inode(ino as i64, mode as i32)?;
+            }
+
+            if let Some(size) = size {
+                self.repository
+                    .update_size_by_inode(ino as i64, size as i64)?;
+            }
+
+            if let Some(atime) = atime {
+                let res = atime.duration_since(UNIX_EPOCH);
+                if let Ok(duration) = res {
+                    self.repository.update_last_access_by_inode(
+                        ino as i64,
+                        NaiveDateTime::from_timestamp(
+                            duration.as_secs() as i64,
+                            duration.subsec_nanos(),
+                        ),
+                    )?;
+                }
+            }
+
+            if let Some(mtime) = mtime {
+                let res = mtime.duration_since(UNIX_EPOCH);
+                if let Ok(duration) = res {
+                    self.repository.update_last_modification_by_inode(
+                        ino as i64,
+                        NaiveDateTime::from_timestamp(
+                            duration.as_secs() as i64,
+                            duration.subsec_nanos(),
+                        ),
+                    )?;
+                }
+            }
+
+            Ok(())
+        });
+
+        if let Err(error) = update_result {
+            log::error!("Failed to update attributes [setattr()]: {:?}", error);
+            reply.error(libc::EIO);
+            return;
+        }
+
+        let entry = self.repository.find_entry_for_inode(ino);
 
         reply.attr(&TTL, &get_attr(&entry.unwrap()));
     }
