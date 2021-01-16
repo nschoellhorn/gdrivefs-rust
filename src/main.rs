@@ -150,12 +150,14 @@ fn create_root(repository: &FilesystemRepository) -> u64 {
                 parent_id: None,
                 name: "StreamDrive".to_string(),
                 entry_type: EntryType::Directory,
-                created_at: date_time.clone(),
+                created_at: date_time,
                 last_modified_at: date_time,
                 remote_type: Some(RemoteType::Directory),
                 inode,
                 size: 0,
                 parent_inode: None,
+                last_accessed_at: date_time,
+                mode: 0o700,
             });
 
             inode as u64
@@ -180,6 +182,8 @@ fn create_shared_drives(repository: &FilesystemRepository, root_inode: u64) -> u
                 inode,
                 size: 0,
                 parent_inode: Some(root_inode as i64),
+                last_accessed_at: date_time,
+                mode: 0o700,
             });
 
             inode as u64
@@ -204,6 +208,8 @@ fn create_my_drives(repository: &FilesystemRepository, root_inode: u64) -> u64 {
                 inode,
                 size: 0,
                 parent_inode: Some(root_inode as i64),
+                last_accessed_at: date_time,
+                mode: 0o700,
             });
 
             inode as u64

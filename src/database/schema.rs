@@ -14,5 +14,7 @@ table! {
         size -> BigInt,
         parent_id -> Nullable<Text>,
         parent_inode -> Nullable<BigInt>,
+        last_accessed_at -> Timestamp,
+        mode -> Integer,
     }
 }

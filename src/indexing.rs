@@ -239,6 +239,8 @@ impl IndexWorker {
                         .parse()
                         .unwrap_or(0),
                     parent_inode,
+                    last_accessed_at: file.modified_time.naive_local(),
+                    mode: 0o700,
                 });
 
                 // but then, we also update all entries that have the current remote id as the parent remote
@@ -454,6 +456,8 @@ impl DriveIndex {
                         inode: self.repository.get_largest_inode() + 1,
                         size: 0,
                         parent_inode: Some(self.shared_drives_inode as i64),
+                        last_accessed_at: drive.created_time.naive_local(),
+                        mode: 0o700,
                     });
                 });
 
