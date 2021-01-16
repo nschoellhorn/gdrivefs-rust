@@ -303,6 +303,29 @@ impl Filesystem for GdriveFs {
         reply.written(_data.len() as u32);
     }
 
+    fn unlink(&mut self, _req: &Request<'_>, parent_ino: u64, name: &OsStr, reply: ReplyEmpty) {
+        let entry = self.repository.find_entry_as_child(parent_ino as i64, name);
+
+        if entry.is_none() {
+            reply.error(libc::ENOENT);
+            return;
+        }
+
+        let entry = entry.unwrap();
+        let result = self.drive_client.delete_file(entry.id.as_str());
+
+        match result {
+            Ok(_) => {
+                let _ = self.repository.remove_entry_by_remote_id(entry.id.as_str());
+                reply.ok();
+            },
+            Err(error) => {
+                log::error!("Failed to delete file [unlink()]: {:?}", error);
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
     fn setattr(
         &mut self,
         _req: &Request<'_>,
