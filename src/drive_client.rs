@@ -196,6 +196,17 @@ impl DriveClient {
             .header(header::AUTHORIZATION, format!("Bearer {}", token)))
     }
 
+    fn delete_authenticated_blocking(&self, url: &str) -> Result<reqwest::blocking::RequestBuilder> {
+        let lock = self.token.lock().unwrap();
+        let token = lock.take();
+        lock.set(token.clone());
+
+        Ok(self
+            .blocking_client
+            .delete(format!("{}{}", *GDRIVE_BASE_URL, url).as_str())
+            .header(header::AUTHORIZATION, format!("Bearer {}", token)))
+    }
+
     pub(crate) fn process_folder_recursively<'a, F>(
         &'a self,
         parent_id: String,
@@ -265,10 +276,11 @@ impl DriveClient {
     pub fn write_file(&self, file_id: &str, data: &[u8]) -> Result<File> {
         Ok(self
             .upload_authenticated_blocking(
-                &format!("/files/{}?uploadType=media", file_id),
+                &format!("/files/{}", file_id),
                 data.to_vec(),
             )?
             .query(&vec![
+                ("uploadType", "media"),
                 ("supportsAllDrives", "true"),
                 (
                     "fields",
@@ -278,6 +290,18 @@ impl DriveClient {
             .header(header::CONTENT_LENGTH, &format!("{}", data.len()))
             .send()?
             .json::<File>()?)
+    }
+
+    pub fn delete_file(&self, file_id: &str) -> Result<()> {
+        self.delete_authenticated_blocking(
+                &format!("/files/{}", file_id)
+            )?
+            .query(&vec![
+                ("supportsAllDrives", "true"),
+            ])
+            .send()?;
+        
+        Ok(())
     }
 
     pub async fn get_change_list(&self, page_token: &str, drive_id: &str) -> Result<ChangeList> {
