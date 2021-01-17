@@ -7,12 +7,10 @@ use crate::{
 };
 use anyhow::Result;
 use chrono::{NaiveDateTime, Utc};
-use diesel::update;
 use fuse::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
-use libc::{S_IRWXG, S_ISUID};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -302,6 +300,10 @@ impl Filesystem for GdriveFs {
         self.pending_writes.insert(_fh, pending_data);
 
         reply.written(_data.len() as u32);
+    }
+
+    fn rmdir(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, reply: ReplyEmpty) {
+        self.unlink(_req, _parent, _name, reply)
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent_ino: u64, name: &OsStr, reply: ReplyEmpty) {

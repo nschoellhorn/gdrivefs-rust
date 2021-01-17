@@ -36,7 +36,10 @@ embed_migrations!("migrations/");
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    SimpleLogger::new().with_level(log::LevelFilter::Info).init().unwrap();
+    SimpleLogger::new()
+        .with_level(log::LevelFilter::Info)
+        .init()
+        .unwrap();
 
     let config_dir = dirs::config_dir().unwrap().join("StreamDrive");
 
@@ -48,6 +51,9 @@ async fn main() -> Result<()> {
         "Using config directory: {}",
         &config_dir.to_str().expect("Str")
     );
+
+    let lock_file = config_dir.join("streamdrive.lock");
+    let is_first_launch = !lock_file.exists();
 
     let config: Config = confy::load_path(&config_dir.join("config.toml"))
         .expect("Unable to read configuration file.");
@@ -96,8 +102,32 @@ async fn main() -> Result<()> {
         config.clone(),
         shared_drives_inode,
     );
-    drive_index.update_drives().await?;
-    drive_index.refresh_full().await?;
+
+    if is_first_launch {
+        tokio::spawn(async move {
+            // We are starting up the full indexing procedure, so create the lock file (and close it again)
+            let _ = std::fs::File::create(lock_file);
+
+            drive_index
+                .update_drives()
+                .await
+                .expect("Updating drives failed.");
+            drive_index
+                .refresh_full()
+                .await
+                .expect("Full indexing failed.");
+
+            // Make sure we get live updates about all the changes to the drive
+            drive_index
+                .start_background_indexing()
+                .await
+                .expect("Failed to incrementally index the drives.");
+        });
+    } else {
+        // Make sure we get live updates about all the changes to the drive
+        drive_index
+            .start_background_indexing();
+    }
 
     log::info!(
         "Indexing finished, mounting filesystem on {}.",
@@ -109,16 +139,12 @@ async fn main() -> Result<()> {
         fuse::mount(filesystem, mount_path, &[]).expect("unable to mount FUSE filesystem");
     });
 
-    // Make sure we get live updates about all the changes to the drive
-    let background_index_handle = drive_index.start_background_indexing();
-
     let mut input = String::new();
     stdin().read_line(&mut input).unwrap();
 
     unmount(&config.general.mount_path);
 
     handle.await?;
-    background_index_handle.await?;
 
     Ok(())
 }
