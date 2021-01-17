@@ -16,12 +16,14 @@ mod filesystem;
 mod indexing;
 
 use crate::config::Config;
-use crate::database::{EntryType, FilesystemEntry, FilesystemRepository, RemoteType};
+use crate::database::entity::{EntryType, FilesystemEntry, RemoteType};
+use crate::database::filesystem::FilesystemRepository;
 use crate::drive_client::{ChangeList, DriveClient};
 use crate::filesystem::GdriveFs;
 use anyhow::Result;
 use diesel_migrations::run_pending_migrations;
 use indexing::{DriveIndex, IndexWriter};
+use simple_logger::SimpleLogger;
 use std::io::{stdin, SeekFrom};
 use std::sync::Arc;
 use std::{io::prelude::*, path::Path};
@@ -34,7 +36,7 @@ embed_migrations!("migrations/");
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    simple_logger::init_with_level(log::Level::Info).unwrap();
+    SimpleLogger::new().with_level(log::LevelFilter::Info).init().unwrap();
 
     let config_dir = dirs::config_dir().unwrap().join("StreamDrive");
 
@@ -49,7 +51,6 @@ async fn main() -> Result<()> {
 
     let config: Config = confy::load_path(&config_dir.join("config.toml"))
         .expect("Unable to read configuration file.");
-    let state_file_name = config_dir.join("state.txt");
 
     let data_dir = Path::new(&config.cache.data_path);
     if !data_dir.exists() {
@@ -83,7 +84,7 @@ async fn main() -> Result<()> {
     let repository = Arc::new(FilesystemRepository::new(connection_pool.clone()));
     let root_inode = create_root(&repository);
     let shared_drives_inode = create_shared_drives(&repository, root_inode);
-    let my_drives_inode = create_my_drives(&repository, root_inode);
+    let _ = create_my_drives(&repository, root_inode);
 
     let filesystem = GdriveFs::new(Arc::clone(&repository), Arc::clone(&drive_client));
 
@@ -94,7 +95,6 @@ async fn main() -> Result<()> {
         connection_pool.clone(),
         config.clone(),
         shared_drives_inode,
-        state_file_name,
     );
     drive_index.update_drives().await?;
     drive_index.refresh_full().await?;
