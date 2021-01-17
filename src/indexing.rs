@@ -28,6 +28,7 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub(crate) enum IndexChange {
     RemoteChange(Change),
+    RemoteChangeList(ChangeList, String),
     FileCreate(FilesystemEntry),
     InstantChange(Box<IndexChange>),
 }
@@ -42,7 +43,12 @@ impl IndexWriter {
         let (tx, rx) = tokio::sync::mpsc::channel(config.indexing.buffer_size);
         IndexWriter {
             publisher: tx,
-            worker: IndexWorker::new(rx, FilesystemRepository::new(pool), config),
+            worker: IndexWorker::new(
+                rx,
+                FilesystemRepository::new(pool.clone()),
+                IndexStateRepository::new(pool),
+                config,
+            ),
         }
     }
 
@@ -63,6 +69,7 @@ struct ChangeBatch {
 struct IndexWorker {
     receiver: Receiver<IndexChange>,
     repository: FilesystemRepository,
+    state_repository: IndexStateRepository,
     config: Config,
     batch: Arc<Mutex<RefCell<ChangeBatch>>>,
 }
@@ -71,6 +78,7 @@ impl IndexWorker {
     fn new(
         receiver: Receiver<IndexChange>,
         repository: FilesystemRepository,
+        state_repository: IndexStateRepository,
         config: Config,
     ) -> Self {
         IndexWorker {
@@ -80,6 +88,7 @@ impl IndexWorker {
                 config.indexing.batch_size,
             )))),
             config,
+            state_repository,
         }
     }
 
@@ -88,8 +97,16 @@ impl IndexWorker {
         let flush_interval = self.config.indexing.batch_flush_interval;
         let batch_size = self.config.indexing.batch_size;
         let repository = self.repository.clone();
+        let state_repository = self.state_repository.clone();
         tokio::spawn(async move {
-            Self::flush_loop(batch_arc, &repository, flush_interval, batch_size).await;
+            Self::flush_loop(
+                batch_arc,
+                &repository,
+                flush_interval,
+                batch_size,
+                &state_repository,
+            )
+            .await;
         });
 
         tokio::spawn(async move {
@@ -102,6 +119,7 @@ impl IndexWorker {
         repository: &FilesystemRepository,
         flush_interval: u8,
         batch_size: usize,
+        state_repository: &IndexStateRepository,
     ) {
         loop {
             let current_time = Utc::now();
@@ -116,7 +134,7 @@ impl IndexWorker {
                 if current_time.signed_duration_since(batch_time).num_seconds()
                     >= (flush_interval as i64)
                 {
-                    Self::flush(Arc::clone(&batch), repository, batch_size)
+                    Self::flush(Arc::clone(&batch), repository, batch_size, state_repository)
                         .await
                         .expect("Unable to flush in flush loop.");
                 }
@@ -130,7 +148,7 @@ impl IndexWorker {
         while let Some(change) = self.receiver.recv().await {
             if let IndexChange::InstantChange(actual_change) = change {
                 // If the change type is InstantChange, we want to process it instantly instead of batching it.
-                Self::process_change(*actual_change, &self.repository);
+                Self::process_change(*actual_change, &self.repository, &self.state_repository);
                 continue;
             }
 
@@ -141,15 +159,23 @@ impl IndexWorker {
                 mut_batch.changes.push(change);
                 mut_batch.latest_change_received = Some(Utc::now());
 
-                mut_batch.changes.len()
+                mut_batch
+                    .changes
+                    .iter()
+                    .map(|change| match change {
+                        IndexChange::RemoteChangeList(change_list, _) => change_list.changes.len(),
+                        _ => 1,
+                    })
+                    .fold(0, |current_value, item| current_value + item)
             };
 
             // We collect a batch of 1000 changes and execute all of them in one transaction
-            if changes_length == self.config.indexing.batch_size {
+            if changes_length >= self.config.indexing.batch_size {
                 Self::flush(
                     Arc::clone(&self.batch),
                     &self.repository,
                     self.config.indexing.batch_size,
+                    &self.state_repository,
                 )
                 .await
                 .expect("Unable to flush batch");
@@ -161,13 +187,24 @@ impl IndexWorker {
         batch: Arc<Mutex<RefCell<ChangeBatch>>>,
         repository: &FilesystemRepository,
         batch_size: usize,
+        state_repository: &IndexStateRepository,
     ) -> Result<(), anyhow::Error> {
         let batch = batch.lock().await;
         let finished_batch = batch.replace(IndexWorker::init_batch(batch_size));
 
-        log::info!("Flushing batch of {} items.", finished_batch.changes.len());
+        log::info!(
+            "Flushing batch of {} items.",
+            finished_batch
+                .changes
+                .iter()
+                .map(|change| match change {
+                    IndexChange::RemoteChangeList(change_list, _) => change_list.changes.len(),
+                    _ => 1,
+                })
+                .fold(0, |current_value, item| current_value + item)
+        );
 
-        Self::process_batch(finished_batch, repository)
+        Self::process_batch(finished_batch, repository, state_repository)
     }
 
     fn init_batch(capacity: usize) -> ChangeBatch {
@@ -180,28 +217,69 @@ impl IndexWorker {
     fn process_batch(
         batch: ChangeBatch,
         repository: &FilesystemRepository,
+        state_repository: &IndexStateRepository,
     ) -> Result<(), anyhow::Error> {
         repository.transaction::<(), anyhow::Error, _>(|| {
             batch
                 .changes
                 .into_iter()
                 .filter(|change| match change {
-                    IndexChange::FileCreate(_) | IndexChange::InstantChange(_) => true,
                     IndexChange::RemoteChange(remote_change) => remote_change.r#type == "file",
+                    _ => true,
                 })
-                .for_each(|change| Self::process_change(change, repository));
+                .for_each(|change| Self::process_change(change, repository, state_repository));
 
             Ok(())
         })
     }
 
-    fn process_change(change: IndexChange, repository: &FilesystemRepository) {
+    fn process_change(
+        change: IndexChange,
+        repository: &FilesystemRepository,
+        state_repository: &IndexStateRepository,
+    ) {
         match change {
             IndexChange::RemoteChange(change) => {
-                if change.removed || change.file.is_some() && change.file.clone().unwrap().trashed {
-                    Self::process_delete(change.fileId.unwrap(), repository);
+                Self::process_remote_change(change, repository);
+            }
+            IndexChange::RemoteChangeList(change_list, drive_id) => {
+                log::trace!("Processing change list");
+                change_list
+                    .changes
+                    .into_iter()
+                    .filter(|change| change.r#type == "file")
+                    .for_each(|change| Self::process_remote_change(change, repository));
+                log::trace!("Change list processed");
+
+                let start_page_token = change_list.new_start_page_token.clone();
+                let next_page_token = change_list.next_page_token.clone();
+                let has_more = next_page_token.is_some();
+                if has_more {
+                    let next_token = next_page_token.unwrap();
+
+                    log::trace!(
+                        "Updating page token for drive {} to {}",
+                        drive_id.as_str(),
+                        next_token.as_str()
+                    );
+                    let res = state_repository
+                        .update_token_for_drive(drive_id.as_str(), next_token.as_str());
+
+                    log::trace!("Update Result: {:?}", res);
                 } else {
-                    Self::process_update(change.file.unwrap(), repository);
+                    log::trace!(
+                        "Updating page token for drive {} to {:?}",
+                        drive_id.as_str(),
+                        start_page_token
+                    );
+
+                    let res = state_repository.update_token_for_drive(
+                        drive_id.as_str(),
+                        &start_page_token.expect(
+                            "Next Start Page Token Not Found, this seems like an logic bug.",
+                        ),
+                    );
+                    log::trace!("Update Result: {:?}", res);
                 }
             }
             IndexChange::FileCreate(mut file) => {
@@ -214,6 +292,17 @@ impl IndexWorker {
                     panic!("Logical flaw detected. InstantChange contains InstantChange.");
                 }
             }
+        }
+    }
+
+    fn process_remote_change(change: Change, repository: &FilesystemRepository) {
+        if change.removed || (change.file.is_some() && change.file.clone().unwrap().trashed) {
+            Self::process_delete(change.fileId.unwrap(), repository);
+        } else {
+            if change.file.is_none() {
+                dbg!(&change);
+            }
+            Self::process_update(change.file.unwrap(), repository);
         }
     }
 
@@ -386,30 +475,21 @@ impl DriveIndex {
                 result.unwrap()
             };
 
-            let start_page_token = change_list.new_start_page_token.clone();
             let next_page_token = change_list.next_page_token.clone();
 
-            for change in change_list.changes.into_iter() {
-                log::trace!("Sending change from [process_pending_changes()] to [worker_loop()]");
+            log::trace!("Sending change from [process_pending_changes()] to [worker_loop()]");
+            if change_list.changes.len() > 0 {
                 self.change_publisher
-                    .send(IndexChange::RemoteChange(change))
+                    .send(IndexChange::RemoteChangeList(
+                        change_list,
+                        index_state.drive_id.clone(),
+                    ))
                     .await?;
             }
 
             has_more = next_page_token.is_some();
             if has_more {
                 current_token = next_page_token.unwrap();
-
-                // TODO: This needs to change because we can't be sure yet, that the changes from the last page really have been saved.
-                let _ = self
-                    .state_repository
-                    .update_token_for_drive(drive_id, &current_token);
-            } else {
-                let _ = self.state_repository.update_token_for_drive(
-                    drive_id,
-                    &start_page_token
-                        .expect("Next Start Page Token Not Found, this seems like an logic bug."),
-                );
             }
         }
 
