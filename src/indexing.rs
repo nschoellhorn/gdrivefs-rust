@@ -1,5 +1,3 @@
-#![feature(async_closure)]
-
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use diesel::{
