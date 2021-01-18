@@ -524,7 +524,9 @@ impl Filesystem for GdriveFs {
             Ok(file) => {
                 // TODO: Improve error handling
                 let remote_id = file.id.clone();
-                IndexWriter::process_create_immediately(file, &self.repository);
+                let new_inode = IndexWriter::process_create_immediately(file, &self.repository);
+
+                let _ = self.repository.update_mode_by_inode(new_inode, mode as i32);
 
                 let cache_entry = self
                     .repository

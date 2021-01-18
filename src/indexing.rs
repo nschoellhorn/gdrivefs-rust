@@ -56,8 +56,8 @@ impl IndexWriter {
         (self.worker.launch(), self.publisher)
     }
 
-    pub(crate) fn process_create_immediately(file: File, repository: &FilesystemRepository) {
-        IndexWorker::process_update(file, repository);
+    pub(crate) fn process_create_immediately(file: File, repository: &FilesystemRepository) -> i64 {
+        IndexWorker::process_update(file, repository)
     }
 }
 
@@ -312,7 +312,7 @@ impl IndexWorker {
             .expect("Unable to execute delete.");
     }
 
-    pub fn process_update(file: File, repository: &FilesystemRepository) {
+    pub fn process_update(file: File, repository: &FilesystemRepository) -> i64 {
         let remote_id = file.id;
         let parent_id = file.parents.first().map(|item| item.clone());
 
@@ -337,6 +337,8 @@ impl IndexWorker {
                     Ok(_) => (),
                     Err(err) => log::warn!("Unable to process update: {:?}", err),
                 }
+
+                inode
             }
             None => {
                 // First, we create the new entry itself
@@ -372,6 +374,8 @@ impl IndexWorker {
                 repository
                     .set_parent_inode_by_parent_id(&remote_id, inode)
                     .expect("Failed to update parent inodes");
+
+                    inode
             }
         }
     }
