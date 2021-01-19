@@ -242,6 +242,7 @@ impl Filesystem for GdriveFs {
             modified_time: current_time,
             name: file_name.to_str().unwrap().to_string(),
             parents: vec![parent_directory.id],
+            mime_type: None,
         });
 
         match create_response {
@@ -321,7 +322,7 @@ impl Filesystem for GdriveFs {
             Ok(_) => {
                 let _ = self.repository.remove_entry_by_remote_id(entry.id.as_str());
                 reply.ok();
-            },
+            }
             Err(error) => {
                 log::error!("Failed to delete file [unlink()]: {:?}", error);
                 reply.error(libc::EIO);
@@ -478,6 +479,68 @@ impl Filesystem for GdriveFs {
         );
         println!("Our reply is {} long", data.len());
         reply.data(data.borrow());
+    }
+
+    fn mkdir(
+        &mut self,
+        _req: &Request<'_>,
+        parent_inode: u64,
+        file_name: &OsStr,
+        mode: u32,
+        reply: ReplyEntry,
+    ) {
+        let parent_directory = self.repository.find_entry_for_inode(parent_inode);
+
+        if parent_directory.is_none() {
+            reply.error(libc::ENOENT);
+            return;
+        }
+
+        let parent_directory = parent_directory.unwrap();
+        if parent_directory.entry_type == EntryType::File {
+            reply.error(libc::ENOTDIR);
+            return;
+        }
+
+        if self
+            .repository
+            .find_entry_as_child(parent_inode as i64, file_name)
+            .is_some()
+        {
+            reply.error(libc::EEXIST);
+            return;
+        }
+
+        let current_time = Utc::now();
+        let create_response = self.drive_client.create_file(FileCreateRequest {
+            created_time: current_time.clone(),
+            modified_time: current_time,
+            name: file_name.to_str().unwrap().to_string(),
+            parents: vec![parent_directory.id],
+            mime_type: Some("application/vnd.google-apps.folder".to_string()),
+        });
+
+        match create_response {
+            Ok(file) => {
+                // TODO: Improve error handling
+                let remote_id = file.id.clone();
+                let new_inode = IndexWriter::process_create_immediately(file, &self.repository);
+
+                let _ = self.repository.update_mode_by_inode(new_inode, mode as i32);
+
+                let cache_entry = self
+                    .repository
+                    .find_entry_by_id(&remote_id)
+                    .expect("Freshly created entry is missing. That sucks.");
+                let attr = get_attr(&cache_entry);
+
+                reply.entry(&TTL, &attr, 1);
+            }
+            Err(err) => {
+                log::error!("Unexpected API error while creating a file: {:?}", err);
+                reply.error(libc::EIO);
+            }
+        }
     }
 
     /*fn statfs(&mut self, request: &Request, inode: u64, reply: ReplyStatfs) {

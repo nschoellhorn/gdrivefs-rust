@@ -75,6 +75,8 @@ pub struct FileCreateRequest {
     pub modified_time: DateTime<Utc>,
     pub name: String,
     pub parents: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

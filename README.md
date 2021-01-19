@@ -44,6 +44,7 @@ The basics. The application can index all **shared drives** you have access to. 
 * Create files
 * Delete files
 * Delete directories
+* Create directories
 * Write to files
 
 > ***Note:*** Writing to files only works as long as the files are written as a whole. Seeking and writing in the middle of files isn't supported. So it mostly depends on the application you are using to write those files.
@@ -52,7 +53,6 @@ The basics. The application can index all **shared drives** you have access to. 
 Biggest thing: performance. It's horrible. Really. In addition:
 
  * "My Drive"
- * Creating directories
  * Seeking in files/(re)writing only parts of a file
  * Local Caching
  * Graceful shutdown/unmounting
