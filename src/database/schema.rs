@@ -21,9 +21,11 @@ table! {
 
 table! {
     use diesel::sql_types::*;
+    use crate::database::entity::RemoteTypeMapping;
 
     index_state (drive_id) {
         drive_id -> Text,
         page_token -> BigInt,
+        remote_type -> RemoteTypeMapping,
     }
 }

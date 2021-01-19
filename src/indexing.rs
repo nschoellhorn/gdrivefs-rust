@@ -375,7 +375,7 @@ impl IndexWorker {
                     .set_parent_inode_by_parent_id(&remote_id, inode)
                     .expect("Failed to update parent inodes");
 
-                    inode
+                inode
             }
         }
     }
@@ -464,7 +464,7 @@ impl DriveIndex {
 
             let result = self
                 .drive_client
-                .get_change_list(current_token_str, drive_id)
+                .get_change_list(current_token_str, drive_id, index_state.remote_type.clone())
                 .await;
 
             let change_list = if let Err(error) = result {
@@ -486,7 +486,7 @@ impl DriveIndex {
                 self.change_publisher
                     .send(IndexChange::RemoteChangeList(
                         change_list,
-                        index_state.drive_id.clone(),
+                        drive_id.to_string(),
                     ))
                     .await?;
             }
@@ -507,7 +507,8 @@ impl DriveIndex {
             .iter()
             .map(|drive| drive.id.clone())
             .collect::<Vec<_>>();
-        let known_drive_ids = self.fs_repository.get_all_drive_ids();
+
+        let known_drive_ids = self.fs_repository.get_all_shared_drive_ids();
 
         dbg!(&known_drive_ids, &accessible_drive_ids);
 
@@ -527,7 +528,9 @@ impl DriveIndex {
             .filter(|drive| !known_drive_ids.contains(&drive.id))
         {
             // We can just silently fail here
-            let _ = self.state_repository.init_state(&drive.id);
+            let _ = self
+                .state_repository
+                .init_state(&drive.id, RemoteType::TeamDrive);
 
             self.change_publisher
                 .send(IndexChange::FileCreate(FilesystemEntry {

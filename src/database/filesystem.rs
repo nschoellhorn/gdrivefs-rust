@@ -11,7 +11,7 @@ use diesel::{select, SqliteConnection};
 use crate::database::schema::filesystem::dsl::*;
 use crate::database::schema::filesystem;
 
-use super::entity::{EntryType, FilesystemEntry};
+use super::entity::{EntryType, FilesystemEntry, RemoteType};
 
 #[derive(Clone)]
 pub struct FilesystemRepository {
@@ -45,6 +45,14 @@ impl FilesystemRepository {
         filesystem
             .select(id)
             .filter(entry_type.eq(EntryType::Drive))
+            .load::<String>(&self.connection.get().unwrap())
+            .expect("Unable to fetch known drives")
+    }
+
+    pub(crate) fn get_all_shared_drive_ids(&self) -> Vec<String> {
+        filesystem
+            .select(id)
+            .filter(remote_type.eq(RemoteType::TeamDrive))
             .load::<String>(&self.connection.get().unwrap())
             .expect("Unable to fetch known drives")
     }

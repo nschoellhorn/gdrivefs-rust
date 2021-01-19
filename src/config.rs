@@ -50,7 +50,6 @@ impl Default for CacheConfig {
 #[derive(Deserialize, Serialize, Clone)]
 pub struct GeneralConfig {
     pub mount_path: String,
-    pub drive_id: String,
 }
 
 impl Default for GeneralConfig {
@@ -63,8 +62,6 @@ impl Default for GeneralConfig {
             mount_path: String::from("/media/StreamDrive"),
             #[cfg(target_os = "macos")]
             mount_path: String::from("/Volumes/StreamDrive"),
-
-            drive_id: String::from("root"),
         }
     }
 }

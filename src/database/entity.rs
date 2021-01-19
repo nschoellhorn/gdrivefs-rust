@@ -11,7 +11,7 @@ pub enum EntryType {
     Directory,
 }
 
-#[derive(Debug, DbEnum)]
+#[derive(Debug, DbEnum, Clone)]
 pub enum RemoteType {
     OwnDrive,
     TeamDrive,
@@ -41,4 +41,5 @@ pub struct FilesystemEntry {
 pub struct IndexState {
     pub drive_id: String,
     pub page_token: i64,
+    pub remote_type: RemoteType,
 }

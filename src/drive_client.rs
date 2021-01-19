@@ -13,7 +13,7 @@ use yup_oauth2::{InstalledFlowAuthenticator, InstalledFlowReturnMethod};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::Config;
+use crate::{config::Config, database::entity::RemoteType};
 
 lazy_static! {
     static ref SCOPES: [&'static str; 1] = ["https://www.googleapis.com/auth/drive",];
@@ -198,7 +198,10 @@ impl DriveClient {
             .header(header::AUTHORIZATION, format!("Bearer {}", token)))
     }
 
-    fn delete_authenticated_blocking(&self, url: &str) -> Result<reqwest::blocking::RequestBuilder> {
+    fn delete_authenticated_blocking(
+        &self,
+        url: &str,
+    ) -> Result<reqwest::blocking::RequestBuilder> {
         let lock = self.token.lock().unwrap();
         let token = lock.take();
         lock.set(token.clone());
@@ -277,10 +280,7 @@ impl DriveClient {
 
     pub fn write_file(&self, file_id: &str, data: &[u8]) -> Result<File> {
         Ok(self
-            .upload_authenticated_blocking(
-                &format!("/files/{}", file_id),
-                data.to_vec(),
-            )?
+            .upload_authenticated_blocking(&format!("/files/{}", file_id), data.to_vec())?
             .query(&vec![
                 ("uploadType", "media"),
                 ("supportsAllDrives", "true"),
@@ -295,27 +295,25 @@ impl DriveClient {
     }
 
     pub fn delete_file(&self, file_id: &str) -> Result<()> {
-        self.delete_authenticated_blocking(
-                &format!("/files/{}", file_id)
-            )?
-            .query(&vec![
-                ("supportsAllDrives", "true"),
-            ])
+        self.delete_authenticated_blocking(&format!("/files/{}", file_id))?
+            .query(&vec![("supportsAllDrives", "true")])
             .send()?;
-        
+
         Ok(())
     }
 
-    pub async fn get_change_list(&self, page_token: &str, drive_id: &str) -> Result<ChangeList> {
-        let response = self.get_authenticated("/changes").await?
-                .query(&vec![
-                    ("pageToken", page_token),
-                    ("includeItemsFromAllDrives", "true"),
-                    ("supportsAllDrives", "true"),
-                    ("driveId", drive_id),
-                    ("fields", "nextPageToken, newStartPageToken, changes(type, changeType, time, removed, fileId, file(id, name, mimeType, parents, createdTime, modifiedTime, size, trashed))"),
-                    ("pageSize", &format!("{}", self.config.indexing.fetch_size)),
-                ]).send().await;
+    pub async fn get_change_list(
+        &self,
+        page_token: &str,
+        drive_id: &str,
+        remote_type: RemoteType,
+    ) -> Result<ChangeList> {
+        let response = self
+            .get_authenticated("/changes")
+            .await?
+            .query(&self.get_change_list_params(page_token, drive_id, remote_type.clone()))
+            .send()
+            .await;
 
         if response.is_err() {
             let err = response.unwrap_err();
@@ -330,7 +328,71 @@ impl DriveClient {
             return Err(anyhow::Error::msg("Something went wrong"));
         }
 
-        Ok(response.json().await?)
+        let parsed_response = response.json::<ChangeList>().await?;
+
+        // This is another quirk of the Google Drive API. If items are trashed, no matter if they were in
+        //  a team drive or the own drive, they will be displayed for the changes to "My Drive". So we need to filter
+        //  out everything that's in trash right now. This needs to be changed if we want to support trash folder
+        //  some day, but for now, that's not a problem.
+        let result = match remote_type {
+            RemoteType::OwnDrive => {
+                let filtered_changes = parsed_response
+                    .changes
+                    .into_iter()
+                    .filter(|change| {
+                        change.file.is_some() && !change.file.as_ref().unwrap().trashed
+                    })
+                    .collect();
+
+                ChangeList {
+                    changes: filtered_changes,
+                    ..parsed_response
+                }
+            }
+            _ => parsed_response,
+        };
+
+        Ok(result)
+    }
+
+    fn get_change_list_params<'a>(
+        &self,
+        page_token: &'a str,
+        drive_id: &'a str,
+        remote_type: RemoteType,
+    ) -> Vec<(&'a str, String)> {
+        match remote_type {
+            // To get the changes for "My Drive", we need to call the API slightly differently
+            RemoteType::OwnDrive => vec![
+                ("pageToken", page_token.to_string()),
+                ("restrictToMyDrive", "true".to_string()),
+                ("spaces", "drive".to_string()),
+                ("fields", "nextPageToken, newStartPageToken, changes(type, changeType, time, removed, fileId, file(id, name, mimeType, parents, createdTime, modifiedTime, size, trashed))".to_string()),
+                ("pageSize", format!("{}", self.config.indexing.fetch_size)),
+            ],
+            _ => vec![
+                ("pageToken", page_token.to_string()),
+                ("includeItemsFromAllDrives", "true".to_string()),
+                ("supportsAllDrives", "true".to_string()),
+                ("driveId", drive_id.to_string()),
+                ("fields", "nextPageToken, newStartPageToken, changes(type, changeType, time, removed, fileId, file(id, name, mimeType, parents, createdTime, modifiedTime, size, trashed))".to_string()),
+                ("pageSize", format!("{}", self.config.indexing.fetch_size)),
+            ]
+        }
+    }
+
+    pub async fn get_file_meta(&self, file_id: &str) -> Result<File> {
+        Ok(self
+            .get_authenticated(&format!("/files/{}", file_id))
+            .await?
+            .query(&vec![(
+                "fields",
+                "id, name, mimeType, parents, createdTime, modifiedTime, size, trashed",
+            )])
+            .send()
+            .await?
+            .json()
+            .await?)
     }
 
     pub fn get_file_content(

@@ -21,6 +21,7 @@ use crate::database::filesystem::FilesystemRepository;
 use crate::drive_client::{ChangeList, DriveClient};
 use crate::filesystem::GdriveFs;
 use anyhow::Result;
+use database::index_state::IndexStateRepository;
 use diesel_migrations::run_pending_migrations;
 use indexing::{DriveIndex, IndexWriter};
 use simple_logger::SimpleLogger;
@@ -88,9 +89,16 @@ async fn main() -> Result<()> {
     run_pending_migrations(&connection_pool.get().unwrap())?;
 
     let repository = Arc::new(FilesystemRepository::new(connection_pool.clone()));
+    let state_repository = IndexStateRepository::new(connection_pool.clone());
     let root_inode = create_root(&repository);
     let shared_drives_inode = create_shared_drives(&repository, root_inode);
-    let _ = create_my_drives(&repository, root_inode);
+
+    // We need to figure out the drive id for "My Drive" (which is the user ID as well, I guess?!)
+    let my_drive_meta = drive_client.get_file_meta("root").await?;
+
+    let _ = create_my_drive(&repository, root_inode, my_drive_meta.id.as_str());
+    // We ignore the result here because we will receive UniqueConstraintViolations on each but the first launch
+    let _ = state_repository.init_state(my_drive_meta.id.as_str(), RemoteType::OwnDrive);
 
     let filesystem = GdriveFs::new(Arc::clone(&repository), Arc::clone(&drive_client));
 
@@ -125,8 +133,7 @@ async fn main() -> Result<()> {
         });
     } else {
         // Make sure we get live updates about all the changes to the drive
-        drive_index
-            .start_background_indexing();
+        drive_index.start_background_indexing();
     }
 
     log::info!(
@@ -167,12 +174,12 @@ fn unmount(path: &str) {
 
 fn create_root(repository: &FilesystemRepository) -> u64 {
     let date_time = chrono::Utc::now().naive_local();
-    match repository.find_inode_by_remote_id("root") {
+    match repository.find_inode_by_remote_id("fs_root") {
         Some(inode) => inode as u64,
         None => {
             let inode = repository.get_largest_inode() + 1;
             repository.create_entry(&FilesystemEntry {
-                id: "root".to_string(),
+                id: "fs_root".to_string(),
                 parent_id: None,
                 name: "StreamDrive".to_string(),
                 entry_type: EntryType::Directory,
@@ -199,7 +206,7 @@ fn create_shared_drives(repository: &FilesystemRepository, root_inode: u64) -> u
             let inode = repository.get_largest_inode() + 1;
             repository.create_entry(&FilesystemEntry {
                 id: "shared_drives".to_string(),
-                parent_id: Some("root".to_string()),
+                parent_id: Some("fs_root".to_string()),
                 name: "Shared Drives".to_string(),
                 entry_type: EntryType::Directory,
                 created_at: date_time,
@@ -217,20 +224,20 @@ fn create_shared_drives(repository: &FilesystemRepository, root_inode: u64) -> u
     }
 }
 
-fn create_my_drives(repository: &FilesystemRepository, root_inode: u64) -> u64 {
+fn create_my_drive(repository: &FilesystemRepository, root_inode: u64, drive_id: &str) -> u64 {
     let date_time = chrono::Utc::now().naive_local();
-    match repository.find_inode_by_remote_id("my_drives") {
+    match repository.find_inode_by_remote_id(drive_id) {
         Some(inode) => inode as u64,
         None => {
             let inode = repository.get_largest_inode() + 1;
             repository.create_entry(&FilesystemEntry {
-                id: "my_drives".to_string(),
-                parent_id: Some("root".to_string()),
-                name: "My Drives".to_string(),
-                entry_type: EntryType::Directory,
+                id: drive_id.to_string(),
+                parent_id: Some("fs_root".to_string()),
+                name: "My Drive".to_string(),
+                entry_type: EntryType::Drive,
                 created_at: date_time,
                 last_modified_at: date_time,
-                remote_type: Some(RemoteType::Directory),
+                remote_type: Some(RemoteType::OwnDrive),
                 inode,
                 size: 0,
                 parent_inode: Some(root_inode as i64),
