@@ -5,7 +5,7 @@ use diesel::r2d2::{ConnectionManager, Pool};
 use crate::database::schema::index_state;
 use crate::database::schema::index_state::dsl::*;
 
-use super::entity::IndexState;
+use super::entity::{IndexState, RemoteType};
 
 #[derive(Clone)]
 pub struct IndexStateRepository {
@@ -17,11 +17,12 @@ impl IndexStateRepository {
         Self { connection: pool }
     }
 
-    pub fn init_state(&self, _drive_id: &str) -> Result<usize> {
+    pub fn init_state(&self, _drive_id: &str, _remote_type: RemoteType) -> Result<usize> {
         Ok(diesel::insert_into(index_state)
             .values(IndexState {
                 drive_id: _drive_id.to_string(),
                 page_token: 1,
+                remote_type: _remote_type,
             })
             .execute(&self.connection.get().unwrap())?)
     }
