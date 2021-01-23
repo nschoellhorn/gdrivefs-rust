@@ -9,6 +9,7 @@ extern crate diesel;
 #[macro_use]
 extern crate diesel_migrations;
 
+mod cache;
 mod config;
 mod database;
 mod drive_client;
@@ -21,6 +22,7 @@ use crate::database::filesystem::FilesystemRepository;
 use crate::drive_client::DriveClient;
 use crate::filesystem::GdriveFs;
 use anyhow::Result;
+use cache::DataCache;
 use database::index_state::IndexStateRepository;
 use diesel_migrations::run_pending_migrations;
 use indexing::DriveIndex;
@@ -100,7 +102,12 @@ async fn main() -> Result<()> {
     // We ignore the result here because we will receive UniqueConstraintViolations on each but the first launch
     let _ = state_repository.init_state(my_drive_meta.id.as_str(), RemoteType::OwnDrive);
 
-    let filesystem = GdriveFs::new(Arc::clone(&repository), Arc::clone(&drive_client));
+    let cache = Arc::new(DataCache::new(Arc::clone(&drive_client)));
+    let filesystem = GdriveFs::new(
+        Arc::clone(&repository),
+        Arc::clone(&drive_client),
+        Arc::clone(&cache),
+    );
 
     log::info!("Starting indexing.");
 
@@ -130,10 +137,16 @@ async fn main() -> Result<()> {
                 .start_background_indexing()
                 .await
                 .expect("Failed to incrementally index the drives.");
+
+            log::debug!("Launching download worker.");
+            cache.run_download_worker();
         });
     } else {
         // Make sure we get live updates about all the changes to the drive
         drive_index.start_background_indexing();
+
+        log::debug!("Launching download worker.");
+        cache.run_download_worker();
     }
 
     log::info!(

@@ -3,6 +3,7 @@ use chrono::NaiveDateTime;
 
 use crate::database::schema::filesystem;
 use crate::database::schema::index_state;
+use crate::database::schema::object_cache_meta;
 
 #[derive(Debug, DbEnum, Hash, Eq, PartialEq)]
 pub enum EntryType {
@@ -36,10 +37,19 @@ pub struct FilesystemEntry {
     pub parent_inode: Option<i64>,
 }
 
-#[derive(Debug, Queryable, Insertable, QueryableByName)]
+#[derive(Debug, Queryable, Insertable)]
 #[table_name = "index_state"]
 pub struct IndexState {
     pub drive_id: String,
     pub page_token: i64,
     pub remote_type: RemoteType,
+}
+
+#[derive(Debug, Queryable, Insertable)]
+#[table_name = "object_cache_meta"]
+pub struct ObjectCacheMetadata {
+    pub file_id: String,
+    pub last_read: Option<NaiveDateTime>,
+    pub last_write: Option<NaiveDateTime>,
+    pub cached_size: i64,
 }

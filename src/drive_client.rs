@@ -388,7 +388,7 @@ impl DriveClient {
             .await?)
     }
 
-    pub fn get_file_content(
+    pub async fn get_file_content(
         &self,
         file_id: &str,
         byte_from: u64,
@@ -396,7 +396,7 @@ impl DriveClient {
     ) -> Result<bytes::Bytes> {
         let request_url = format!("/files/{}", file_id);
         dbg!(&request_url);
-        let mut request = self.get_authenticated_blocking(request_url.as_str());
+        let mut request = self.get_authenticated(request_url.as_str()).await?;
         let params = vec![
             ("alt".to_string(), "media".to_string()),
             ("supportsAllDrives".to_string(), "true".to_string()),
@@ -406,13 +406,13 @@ impl DriveClient {
             .header("Range", format!("bytes={}-{}", byte_from, byte_to).as_str())
             .query(&params);
 
-        let response = request.send().context("Network failure or something")?;
+        let response = request.send().await.context("Network failure or something")?;
         if !response.status().is_success() {
-            dbg!(response.text()?);
+            dbg!(response.text().await?);
             return Err(anyhow::Error::msg("Something went wrong"));
         }
 
-        Ok(response.bytes()?)
+        Ok(response.bytes().await?)
     }
 
     pub async fn get_files_in_parent(&self, parent_id: &str) -> Result<Vec<File>> {

@@ -29,3 +29,14 @@ table! {
         remote_type -> RemoteTypeMapping,
     }
 }
+
+table! {
+    use diesel::sql_types::*;
+
+    object_cache_meta (file_id) {
+        file_id -> Text,
+        last_read -> Nullable<Timestamp>,
+        last_write -> Nullable<Timestamp>,
+        cached_size -> BigInt,
+    }
+}

@@ -1,4 +1,4 @@
-use crate::drive_client::DriveClient;
+use crate::{cache::DataCache, drive_client::DriveClient};
 use crate::{
     database::entity::{EntryType, FilesystemEntry},
     database::filesystem::FilesystemRepository,
@@ -11,6 +11,7 @@ use fuse::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
+use libc::{O_CREAT, O_RDONLY, O_WRONLY};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -29,12 +30,14 @@ pub(crate) struct GdriveFs {
     drive_client: Arc<DriveClient>,
     pending_writes: HashMap<u64, Vec<u8>>,
     users_cache: UsersCache,
+    cache: Arc<DataCache>,
 }
 
 impl GdriveFs {
     pub(crate) fn new(
         repository: Arc<FilesystemRepository>,
         drive_client: Arc<DriveClient>,
+        cache: Arc<DataCache>,
     ) -> Self {
         Self {
             repository,
@@ -43,6 +46,7 @@ impl GdriveFs {
             drive_client,
             pending_writes: HashMap::new(),
             users_cache: unsafe { UsersCache::with_all_users() },
+            cache,
         }
     }
 
@@ -411,7 +415,7 @@ impl Filesystem for GdriveFs {
         reply.attr(&TTL, &self.get_attr(&entry.unwrap()));
     }
 
-    fn open(&mut self, _req: &Request, _ino: u64, _flags: u32, reply: ReplyOpen) {
+    fn open(&mut self, _req: &Request, _ino: u64, flags: u32, reply: ReplyOpen) {
         let fs_entry = self.repository.find_entry_for_inode(_ino);
 
         if fs_entry.is_none() {
@@ -419,8 +423,17 @@ impl Filesystem for GdriveFs {
             return;
         }
 
-        let file_handle = self.make_file_handle(fs_entry.unwrap().id);
-        reply.opened(file_handle, _flags);
+        let remote_id = fs_entry.unwrap().id;
+        let file_handle = self.make_file_handle(remote_id.clone());
+        reply.opened(file_handle, flags);
+
+        // if we are in write-only mode, we don't need to warm up the read cache
+        if (flags as i32) & libc::O_WRONLY > 0 {
+            return;
+        }
+
+        // If the file was opened in read mode, we want to make sure we already start caching chunks of the file
+        //self.cache.warmup_key(remote_id);
     }
 
     fn read(
@@ -461,11 +474,10 @@ impl Filesystem for GdriveFs {
             std::cmp::min(_offset + _size as i64, file_entry.size) as u64 - 1
         );
 
-        let client = Arc::clone(&self.drive_client);
-        let data = client.get_file_content(
-            remote_id.as_str(),
+        let data = self.cache.get_chunk(
+            remote_id,
             _offset as u64,
-            std::cmp::min(_offset + _size as i64, file_entry.size) as u64 - 1,
+            std::cmp::min(_size as i64, file_entry.size) as u32,
         );
 
         if data.is_err() {
@@ -475,13 +487,12 @@ impl Filesystem for GdriveFs {
 
         let data = data.unwrap();
 
-        use std::borrow::Borrow;
         println!(
             "Replying with some data for this request :: Offset: {}, Size: {}, Inode: {}",
             _offset, _size, _ino
         );
         println!("Our reply is {} long", data.len());
-        reply.data(data.borrow());
+        reply.data(data.as_ref());
     }
 
     fn mkdir(
