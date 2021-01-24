@@ -18,35 +18,7 @@ use std::ops::Add;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-fn get_attr(entry: &FilesystemEntry) -> FileAttr {
-    let created = UNIX_EPOCH.add(Duration::from_secs(entry.created_at.timestamp() as u64));
-    let modified = UNIX_EPOCH.add(Duration::from_secs(
-        entry.last_modified_at.timestamp() as u64
-    ));
-    let accessed = UNIX_EPOCH.add(Duration::from_secs(
-        entry.last_accessed_at.timestamp() as u64
-    ));
-
-    let kind = GdriveFs::entry_type_to_file_type(&entry.entry_type);
-
-    FileAttr {
-        ino: entry.inode as u64,
-        size: entry.size as u64,
-        blocks: 0,
-        atime: accessed, // 1970-01-01 00:00:00
-        mtime: modified,
-        ctime: modified,
-        crtime: created,
-        kind,
-        perm: entry.mode as u16,
-        nlink: 0,
-        uid: 1000, // TODO: which user id do we wanna use? Just the current user?
-        gid: 1000, // TODO: which group id do we wanna use? Just the current group?
-        rdev: 0,
-        flags: 0,
-    }
-}
+use users::{Users, UsersCache};
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -56,6 +28,7 @@ pub(crate) struct GdriveFs {
     latest_file_handle: Mutex<Cell<u64>>,
     drive_client: Arc<DriveClient>,
     pending_writes: HashMap<u64, Vec<u8>>,
+    users_cache: UsersCache,
 }
 
 impl GdriveFs {
@@ -69,6 +42,35 @@ impl GdriveFs {
             latest_file_handle: Mutex::new(Cell::new(0)),
             drive_client,
             pending_writes: HashMap::new(),
+            users_cache: unsafe { UsersCache::with_all_users() },
+        }
+    }
+
+    fn get_attr(&self, entry: &FilesystemEntry) -> FileAttr {
+        let created = UNIX_EPOCH.add(Duration::from_secs(entry.created_at.timestamp() as u64));
+        let modified = UNIX_EPOCH.add(Duration::from_secs(
+            entry.last_modified_at.timestamp() as u64
+        ));
+    
+        let kind = GdriveFs::entry_type_to_file_type(&entry.entry_type);
+    
+        let uid = self.users_cache.get_current_uid();
+        
+        FileAttr {
+            ino: entry.inode as u64,
+            size: entry.size as u64,
+            blocks: 0,
+            atime: created, // 1970-01-01 00:00:00
+            mtime: modified,
+            ctime: modified,
+            crtime: created,
+            kind,
+            perm: 0o700,
+            nlink: 2,
+            uid: uid,
+            gid: uid,
+            rdev: 0,
+            flags: 0,
         }
     }
 
@@ -123,7 +125,7 @@ impl Filesystem for GdriveFs {
             .repository
             .find_entry_as_child(parent_inode as i64, entry_name);
         match entry {
-            Some(fs_entry) => reply.entry(&TTL, &get_attr(&fs_entry), 0),
+            Some(fs_entry) => reply.entry(&TTL, &self.get_attr(&fs_entry), 0),
             None => reply.error(libc::ENOENT),
         }
     }
@@ -131,7 +133,7 @@ impl Filesystem for GdriveFs {
     fn getattr(&mut self, request: &Request, inode: u64, reply: ReplyAttr) {
         let entry = self.repository.find_entry_for_inode(inode);
         match entry {
-            Some(fs_entry) => reply.attr(&TTL, &get_attr(&fs_entry)),
+            Some(fs_entry) => reply.attr(&TTL, &self.get_attr(&fs_entry)),
             None => {
                 println!(
                     r#"
@@ -255,7 +257,7 @@ impl Filesystem for GdriveFs {
                     .repository
                     .find_entry_by_id(&remote_id)
                     .expect("Freshly created entry is missing. That sucks.");
-                let attr = get_attr(&cache_entry);
+                let attr = self.get_attr(&cache_entry);
                 let handle = self.make_file_handle(remote_id);
 
                 reply.created(&TTL, &attr, 1, handle, _flags);
@@ -405,7 +407,7 @@ impl Filesystem for GdriveFs {
 
         let entry = self.repository.find_entry_for_inode(ino);
 
-        reply.attr(&TTL, &get_attr(&entry.unwrap()));
+        reply.attr(&TTL, &self.get_attr(&entry.unwrap()));
     }
 
     fn open(&mut self, _req: &Request, _ino: u64, _flags: u32, reply: ReplyOpen) {
@@ -513,7 +515,7 @@ impl Filesystem for GdriveFs {
 
         let current_time = Utc::now();
         let create_response = self.drive_client.create_file(FileCreateRequest {
-            created_time: current_time.clone(),
+            created_time: current_time,
             modified_time: current_time,
             name: file_name.to_str().unwrap().to_string(),
             parents: vec![parent_directory.id],
@@ -532,7 +534,7 @@ impl Filesystem for GdriveFs {
                     .repository
                     .find_entry_by_id(&remote_id)
                     .expect("Freshly created entry is missing. That sucks.");
-                let attr = get_attr(&cache_entry);
+                let attr = self.get_attr(&cache_entry);
 
                 reply.entry(&TTL, &attr, 1);
             }
