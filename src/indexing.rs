@@ -152,7 +152,7 @@ impl IndexWorker {
                 continue;
             }
 
-            let changes_length = {
+            let changes_length: usize = {
                 let batch = self.batch.lock().await;
                 let mut mut_batch = batch.borrow_mut();
 
@@ -166,7 +166,7 @@ impl IndexWorker {
                         IndexChange::RemoteChangeList(change_list, _) => change_list.changes.len(),
                         _ => 1,
                     })
-                    .fold(0, |current_value, item| current_value + item)
+                    .sum()
             };
 
             // We collect a batch of 1000 changes and execute all of them in one transaction
@@ -201,7 +201,7 @@ impl IndexWorker {
                     IndexChange::RemoteChangeList(change_list, _) => change_list.changes.len(),
                     _ => 1,
                 })
-                .fold(0, |current_value, item| current_value + item)
+                .sum::<usize>()
         );
 
         Self::process_batch(finished_batch, repository, state_repository)
@@ -252,7 +252,7 @@ impl IndexWorker {
                 log::trace!("Change list processed");
 
                 let start_page_token = change_list.new_start_page_token.clone();
-                let next_page_token = change_list.next_page_token.clone();
+                let next_page_token = change_list.next_page_token;
                 let has_more = next_page_token.is_some();
                 if has_more {
                     let next_token = next_page_token.unwrap();
@@ -297,7 +297,7 @@ impl IndexWorker {
 
     fn process_remote_change(change: Change, repository: &FilesystemRepository) {
         if change.removed || (change.file.is_some() && change.file.clone().unwrap().trashed) {
-            Self::process_delete(change.fileId.unwrap(), repository);
+            Self::process_delete(change.file_id.unwrap(), repository);
         } else {
             if change.file.is_none() {
                 dbg!(&change);
@@ -314,7 +314,7 @@ impl IndexWorker {
 
     pub fn process_update(file: File, repository: &FilesystemRepository) -> i64 {
         let remote_id = file.id;
-        let parent_id = file.parents.first().map(|item| item.clone());
+        let parent_id = file.parents.first().cloned();
 
         let parent_inode = if let Some(parent_remote) = parent_id.as_ref() {
             repository.find_inode_by_remote_id(parent_remote.as_str())
@@ -328,7 +328,7 @@ impl IndexWorker {
                 match repository.update_entry_by_inode(
                     inode,
                     file.size
-                        .unwrap_or("0".to_string())
+                        .unwrap_or_else(|| "0".to_string())
                         .as_str()
                         .parse()
                         .unwrap_or(0),
@@ -360,7 +360,7 @@ impl IndexWorker {
                     id: remote_id.clone(),
                     size: file
                         .size
-                        .unwrap_or("0".to_string())
+                        .unwrap_or_else(|| "0".to_string())
                         .as_str()
                         .parse()
                         .unwrap_or(0),
@@ -482,7 +482,7 @@ impl DriveIndex {
             let next_page_token = change_list.next_page_token.clone();
 
             log::trace!("Sending change from [process_pending_changes()] to [worker_loop()]");
-            if change_list.changes.len() > 0 {
+            if !change_list.changes.is_empty() {
                 self.change_publisher
                     .send(IndexChange::RemoteChangeList(
                         change_list,

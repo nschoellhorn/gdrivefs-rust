@@ -96,7 +96,7 @@ impl FilesystemRepository {
         .load::<FilesystemEntry>(&self.connection.get().unwrap())
         .optional()
         .expect("Error searching filesystem entry")
-        .map(|vec| vec.into_iter().nth(0))
+        .map(|vec| vec.into_iter().next())
         .flatten()
         .map(|entry| entry.inode)
     }
@@ -125,7 +125,7 @@ impl FilesystemRepository {
             .load::<FilesystemEntry>(&self.connection.get().unwrap())
             .optional()
             .expect("Error searching filesystem entry")
-            .map(|vec| vec.into_iter().nth(0))
+            .map(|vec| vec.into_iter().next())
             .flatten()
     }
 
@@ -181,10 +181,7 @@ impl FilesystemRepository {
         diesel::insert_into(filesystem)
             .values(fs_entry)
             .execute(&self.connection.get().unwrap())
-            .expect(&format!(
-                "Unable to insert new entry: {}#{}",
-                fs_entry.name, fs_entry.id
-            ));
+            .unwrap_or_else(|_| panic!("Unable to insert new entry: {}#{}", fs_entry.name, fs_entry.id));
     }
 
     pub(crate) fn find_entry_by_id(&self, rid: &str) -> Option<FilesystemEntry> {

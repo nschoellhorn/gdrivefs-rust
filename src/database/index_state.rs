@@ -2,7 +2,6 @@ use anyhow::Result;
 use diesel::prelude::*;
 use diesel::r2d2::{ConnectionManager, Pool};
 
-use crate::database::schema::index_state;
 use crate::database::schema::index_state::dsl::*;
 
 use super::entity::{IndexState, RemoteType};

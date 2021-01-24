@@ -18,16 +18,16 @@ mod indexing;
 use crate::config::Config;
 use crate::database::entity::{EntryType, FilesystemEntry, RemoteType};
 use crate::database::filesystem::FilesystemRepository;
-use crate::drive_client::{ChangeList, DriveClient};
+use crate::drive_client::DriveClient;
 use crate::filesystem::GdriveFs;
 use anyhow::Result;
 use database::index_state::IndexStateRepository;
 use diesel_migrations::run_pending_migrations;
-use indexing::{DriveIndex, IndexWriter};
+use indexing::DriveIndex;
 use simple_logger::SimpleLogger;
-use std::io::{stdin, SeekFrom};
+use std::io::stdin;
 use std::sync::Arc;
-use std::{io::prelude::*, path::Path};
+use std::path::Path;
 
 lazy_static! {
     static ref CREDENTIALS_PATH: &'static str = "clientCredentials.json";
@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
 
     log::info!("Using data directory: {}", data_dir.to_str().unwrap());
 
-    let blocking_client = tokio::task::spawn_blocking(|| reqwest::blocking::Client::new()).await?;
+    let blocking_client = tokio::task::spawn_blocking(reqwest::blocking::Client::new).await?;
     let drive_client =
         Arc::new(DriveClient::create(*CREDENTIALS_PATH, blocking_client, config.clone()).await?);
     let connection_manager =

@@ -18,7 +18,7 @@ use std::ops::Add;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use users::{Users, UsersCache};
+use users::{Users, Groups, UsersCache};
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -55,6 +55,7 @@ impl GdriveFs {
         let kind = GdriveFs::entry_type_to_file_type(&entry.entry_type);
     
         let uid = self.users_cache.get_current_uid();
+        let gid = self.users_cache.get_current_gid();
         
         FileAttr {
             ino: entry.inode as u64,
@@ -67,8 +68,8 @@ impl GdriveFs {
             kind,
             perm: 0o700,
             nlink: 2,
-            uid: uid,
-            gid: uid,
+            uid,
+            gid,
             rdev: 0,
             flags: 0,
         }
@@ -89,7 +90,7 @@ impl GdriveFs {
         self.file_handles
             .lock()
             .unwrap()
-            .insert(fh, remote_id.clone());
+            .insert(fh, remote_id);
 
         lock.set(fh);
 
@@ -240,7 +241,7 @@ impl Filesystem for GdriveFs {
 
         let current_time = Utc::now();
         let create_response = self.drive_client.create_file(FileCreateRequest {
-            created_time: current_time.clone(),
+            created_time: current_time,
             modified_time: current_time,
             name: file_name.to_str().unwrap().to_string(),
             parents: vec![parent_directory.id],
@@ -280,12 +281,12 @@ impl Filesystem for GdriveFs {
         reply: ReplyWrite,
     ) {
         // We are limited by the backing Vec<> of pending changes here
-        if (_offset as usize + _data.len()) > usize::MAX {
+        if (_offset as u64 + _data.len() as u64) > usize::MAX as u64 {
             reply.error(libc::E2BIG);
             return;
         }
 
-        let mut pending_data = self.pending_writes.remove(&_fh).unwrap_or(Vec::new());
+        let mut pending_data = self.pending_writes.remove(&_fh).unwrap_or_else(Vec::new);
 
         let write_index = _offset as usize;
         _data
@@ -467,7 +468,7 @@ impl Filesystem for GdriveFs {
             std::cmp::min(_offset + _size as i64, file_entry.size) as u64 - 1,
         );
 
-        if let Err(_) = data {
+        if data.is_err() {
             reply.error(libc::EIO);
             return;
         }

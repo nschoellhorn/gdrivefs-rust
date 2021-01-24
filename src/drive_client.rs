@@ -42,7 +42,7 @@ pub struct Change {
     pub change_type: String,
     pub time: DateTime<Utc>,
     pub removed: bool,
-    pub fileId: Option<String>,
+    pub file_id: Option<String>,
     pub file: Option<File>,
 }
 
@@ -156,7 +156,7 @@ impl DriveClient {
         &self,
         url: &str,
         body: &T,
-    ) -> Result<reqwest::blocking::RequestBuilder>
+    ) -> reqwest::blocking::RequestBuilder
     where
         T: Serialize + ?Sized,
     {
@@ -164,52 +164,45 @@ impl DriveClient {
         let token = lock.take();
         lock.set(token.clone());
 
-        Ok(self
-            .blocking_client
+        self.blocking_client
             .post(format!("{}{}", *GDRIVE_BASE_URL, url).as_str())
             .json(body)
-            .header(header::AUTHORIZATION, format!("Bearer {}", token)))
+            .header(header::AUTHORIZATION, format!("Bearer {}", token))
     }
 
     fn upload_authenticated_blocking(
         &self,
         url: &str,
         body: Vec<u8>,
-    ) -> Result<reqwest::blocking::RequestBuilder> {
+    ) -> reqwest::blocking::RequestBuilder {
         let lock = self.token.lock().unwrap();
         let token = lock.take();
         lock.set(token.clone());
 
-        Ok(self
-            .blocking_client
+        self.blocking_client
             .patch(format!("{}{}", *GDRIVE_UPLOAD_BASE_URL, url).as_str())
             .body(body)
-            .header(header::AUTHORIZATION, format!("Bearer {}", token)))
+            .header(header::AUTHORIZATION, format!("Bearer {}", token))
     }
 
-    fn get_authenticated_blocking(&self, url: &str) -> Result<reqwest::blocking::RequestBuilder> {
+    fn get_authenticated_blocking(&self, url: &str) -> reqwest::blocking::RequestBuilder {
         let lock = self.token.lock().unwrap();
         let token = lock.take();
         lock.set(token.clone());
 
-        Ok(self
-            .blocking_client
+        self.blocking_client
             .get(format!("{}{}", *GDRIVE_BASE_URL, url).as_str())
-            .header(header::AUTHORIZATION, format!("Bearer {}", token)))
+            .header(header::AUTHORIZATION, format!("Bearer {}", token))
     }
 
-    fn delete_authenticated_blocking(
-        &self,
-        url: &str,
-    ) -> Result<reqwest::blocking::RequestBuilder> {
+    fn delete_authenticated_blocking(&self, url: &str) -> reqwest::blocking::RequestBuilder {
         let lock = self.token.lock().unwrap();
         let token = lock.take();
         lock.set(token.clone());
 
-        Ok(self
-            .blocking_client
+        self.blocking_client
             .delete(format!("{}{}", *GDRIVE_BASE_URL, url).as_str())
-            .header(header::AUTHORIZATION, format!("Bearer {}", token)))
+            .header(header::AUTHORIZATION, format!("Bearer {}", token))
     }
 
     pub(crate) fn process_folder_recursively<'a, F>(
@@ -266,7 +259,7 @@ impl DriveClient {
 
     pub fn create_file(&self, create_request: FileCreateRequest) -> Result<File> {
         Ok(self
-            .post_authenticated_blocking("/files", &create_request)?
+            .post_authenticated_blocking("/files", &create_request)
             .query(&vec![
                 ("supportsAllDrives", "true"),
                 (
@@ -280,7 +273,7 @@ impl DriveClient {
 
     pub fn write_file(&self, file_id: &str, data: &[u8]) -> Result<File> {
         Ok(self
-            .upload_authenticated_blocking(&format!("/files/{}", file_id), data.to_vec())?
+            .upload_authenticated_blocking(&format!("/files/{}", file_id), data.to_vec())
             .query(&vec![
                 ("uploadType", "media"),
                 ("supportsAllDrives", "true"),
@@ -295,7 +288,7 @@ impl DriveClient {
     }
 
     pub fn delete_file(&self, file_id: &str) -> Result<()> {
-        self.delete_authenticated_blocking(&format!("/files/{}", file_id))?
+        self.delete_authenticated_blocking(&format!("/files/{}", file_id))
             .query(&vec![("supportsAllDrives", "true")])
             .send()?;
 
@@ -403,7 +396,7 @@ impl DriveClient {
     ) -> Result<bytes::Bytes> {
         let request_url = format!("/files/{}", file_id);
         dbg!(&request_url);
-        let mut request = self.get_authenticated_blocking(request_url.as_str())?;
+        let mut request = self.get_authenticated_blocking(request_url.as_str());
         let params = vec![
             ("alt".to_string(), "media".to_string()),
             ("supportsAllDrives".to_string(), "true".to_string()),
