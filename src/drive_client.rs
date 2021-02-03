@@ -1,17 +1,17 @@
+use std::cell::Cell;
+use std::collections::HashMap;
+use std::future::Future;
+use std::sync::{Arc, Mutex};
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use futures::future::{FutureExt, LocalBoxFuture};
 use hyper::client::HttpConnector;
 use hyper_rustls::HttpsConnector;
-use reqwest::{header, Client, RequestBuilder};
-use std::cell::Cell;
-use std::collections::HashMap;
-use std::future::Future;
-use std::sync::{Arc, Mutex};
-use yup_oauth2::authenticator::Authenticator;
-use yup_oauth2::{InstalledFlowAuthenticator, InstalledFlowReturnMethod};
-
+use reqwest::{Client, header, RequestBuilder};
 use serde::{Deserialize, Serialize};
+use yup_oauth2::{InstalledFlowAuthenticator, InstalledFlowReturnMethod};
+use yup_oauth2::authenticator::Authenticator;
 
 use crate::{config::Config, database::entity::RemoteType};
 

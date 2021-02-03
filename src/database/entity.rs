@@ -1,9 +1,9 @@
-use diesel_derive_enum::DbEnum;
 use chrono::NaiveDateTime;
+use diesel_derive_enum::DbEnum;
 
 use crate::database::schema::filesystem;
 use crate::database::schema::index_state;
-use crate::database::schema::object_cache_meta;
+use crate::database::schema::object_chunk;
 
 #[derive(Debug, DbEnum, Hash, Eq, PartialEq)]
 pub enum EntryType {
@@ -45,11 +45,28 @@ pub struct IndexState {
     pub remote_type: RemoteType,
 }
 
-#[derive(Debug, Queryable, Insertable)]
-#[table_name = "object_cache_meta"]
-pub struct ObjectCacheMetadata {
+#[derive(Debug, Queryable, QueryableByName)]
+#[table_name = "object_chunk"]
+pub struct ObjectChunk {
+    pub id: i64,
     pub file_id: String,
+    pub chunk_sequence: i32,
     pub last_read: Option<NaiveDateTime>,
     pub last_write: Option<NaiveDateTime>,
     pub cached_size: i64,
+    pub byte_from: i64,
+    pub byte_to: i64,
+    pub is_complete: bool,
+    pub object_name: String,
+}
+
+#[derive(Debug, Insertable)]
+#[table_name = "object_chunk"]
+pub struct NewObjectChunk {
+    pub file_id: String,
+    pub chunk_sequence: i32,
+    pub cached_size: i64,
+    pub byte_from: i64,
+    pub byte_to: i64,
+    pub object_name: String,
 }

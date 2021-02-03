@@ -1,13 +1,27 @@
-#![feature(async_closure)]
-
+#[macro_use]
+extern crate diesel;
+#[macro_use]
+extern crate diesel_migrations;
 #[macro_use]
 extern crate lazy_static;
 
-#[macro_use]
-extern crate diesel;
+use std::{io::stdin, sync::Mutex};
+use std::path::Path;
+use std::sync::{Arc, RwLock};
 
-#[macro_use]
-extern crate diesel_migrations;
+use anyhow::Result;
+use diesel_migrations::run_pending_migrations;
+use simple_logger::SimpleLogger;
+
+use cache::DataCache;
+use database::index_state::IndexStateRepository;
+use indexing::DriveIndex;
+
+use crate::config::Config;
+use crate::database::entity::{EntryType, FilesystemEntry, RemoteType};
+use crate::database::filesystem::FilesystemRepository;
+use crate::drive_client::DriveClient;
+use crate::filesystem::GdriveFs;
 
 mod cache;
 mod config;
@@ -15,21 +29,6 @@ mod database;
 mod drive_client;
 mod filesystem;
 mod indexing;
-
-use crate::config::Config;
-use crate::database::entity::{EntryType, FilesystemEntry, RemoteType};
-use crate::database::filesystem::FilesystemRepository;
-use crate::drive_client::DriveClient;
-use crate::filesystem::GdriveFs;
-use anyhow::Result;
-use cache::DataCache;
-use database::index_state::IndexStateRepository;
-use diesel_migrations::run_pending_migrations;
-use indexing::DriveIndex;
-use simple_logger::SimpleLogger;
-use std::io::stdin;
-use std::sync::Arc;
-use std::path::Path;
 
 lazy_static! {
     static ref CREDENTIALS_PATH: &'static str = "clientCredentials.json";
@@ -40,7 +39,9 @@ embed_migrations!("migrations/");
 #[tokio::main]
 async fn main() -> Result<()> {
     SimpleLogger::new()
-        .with_level(log::LevelFilter::Info)
+        .with_level(log::LevelFilter::Info) // Everything from the libs shall be relatively silent
+        //.with_module_level("fuse", log::LevelFilter::Debug) // We want to debug native filesystem stuff
+        .with_module_level(module_path!(), log::LevelFilter::Debug) // For our own crate, we want to "DEBUG"
         .init()
         .unwrap();
 
@@ -102,7 +103,11 @@ async fn main() -> Result<()> {
     // We ignore the result here because we will receive UniqueConstraintViolations on each but the first launch
     let _ = state_repository.init_state(my_drive_meta.id.as_str(), RemoteType::OwnDrive);
 
-    let cache = Arc::new(DataCache::new(Arc::clone(&drive_client)));
+    let cache = Arc::new(RwLock::new(DataCache::new(
+        Arc::clone(&drive_client),
+        connection_pool.clone(),
+        config.clone(),
+    )));
     let filesystem = GdriveFs::new(
         Arc::clone(&repository),
         Arc::clone(&drive_client),
@@ -117,6 +122,8 @@ async fn main() -> Result<()> {
         config.clone(),
         shared_drives_inode,
     );
+
+    cache::run_download_worker(cache);
 
     if is_first_launch {
         tokio::spawn(async move {
@@ -137,16 +144,10 @@ async fn main() -> Result<()> {
                 .start_background_indexing()
                 .await
                 .expect("Failed to incrementally index the drives.");
-
-            log::debug!("Launching download worker.");
-            cache.run_download_worker();
         });
     } else {
         // Make sure we get live updates about all the changes to the drive
         drive_index.start_background_indexing();
-
-        log::debug!("Launching download worker.");
-        cache.run_download_worker();
     }
 
     log::info!(

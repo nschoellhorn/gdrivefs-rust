@@ -33,10 +33,16 @@ table! {
 table! {
     use diesel::sql_types::*;
 
-    object_cache_meta (file_id) {
+    object_chunk (id) {
+        id -> BigInt,
         file_id -> Text,
+        chunk_sequence -> Integer,
         last_read -> Nullable<Timestamp>,
         last_write -> Nullable<Timestamp>,
         cached_size -> BigInt,
+        byte_from -> BigInt,
+        byte_to -> BigInt,
+        is_complete -> Bool,
+        object_name -> Text,
     }
 }

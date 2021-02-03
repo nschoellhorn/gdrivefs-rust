@@ -1,3 +1,7 @@
+use core::panic;
+use std::cell::RefCell;
+use std::sync::Arc;
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use diesel::{
@@ -21,9 +25,6 @@ use crate::{
     database::filesystem::FilesystemRepository,
     drive_client::{Change, ChangeList, DriveClient, File},
 };
-use core::panic;
-use std::cell::RefCell;
-use std::sync::Arc;
 
 #[derive(Debug)]
 pub(crate) enum IndexChange {

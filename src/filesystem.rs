@@ -1,3 +1,19 @@
+use std::cell::Cell;
+use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::ops::Add;
+use std::sync::{Arc, RwLock};
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use anyhow::Result;
+use chrono::{NaiveDateTime, Utc};
+use fuse::{
+    FileAttr, Filesystem, FileType, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, ReplyWrite, Request,
+};
+use users::{Groups, Users, UsersCache};
+
 use crate::{cache::DataCache, drive_client::DriveClient};
 use crate::{
     database::entity::{EntryType, FilesystemEntry},
@@ -5,21 +21,6 @@ use crate::{
     drive_client::FileCreateRequest,
     indexing::IndexWriter,
 };
-use anyhow::Result;
-use chrono::{NaiveDateTime, Utc};
-use fuse::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyWrite, Request,
-};
-use libc::{O_CREAT, O_RDONLY, O_WRONLY};
-use std::cell::Cell;
-use std::collections::HashMap;
-use std::ffi::OsStr;
-use std::ops::Add;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use users::{Users, Groups, UsersCache};
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -30,14 +31,14 @@ pub(crate) struct GdriveFs {
     drive_client: Arc<DriveClient>,
     pending_writes: HashMap<u64, Vec<u8>>,
     users_cache: UsersCache,
-    cache: Arc<DataCache>,
+    cache: Arc<RwLock<DataCache>>,
 }
 
 impl GdriveFs {
     pub(crate) fn new(
         repository: Arc<FilesystemRepository>,
         drive_client: Arc<DriveClient>,
-        cache: Arc<DataCache>,
+        cache: Arc<RwLock<DataCache>>,
     ) -> Self {
         Self {
             repository,
@@ -55,12 +56,12 @@ impl GdriveFs {
         let modified = UNIX_EPOCH.add(Duration::from_secs(
             entry.last_modified_at.timestamp() as u64
         ));
-    
+
         let kind = GdriveFs::entry_type_to_file_type(&entry.entry_type);
-    
+
         let uid = self.users_cache.get_current_uid();
         let gid = self.users_cache.get_current_gid();
-        
+
         FileAttr {
             ino: entry.inode as u64,
             size: entry.size as u64,
@@ -91,10 +92,7 @@ impl GdriveFs {
         let lock = self.latest_file_handle.lock().unwrap();
         let fh = lock.get() + 1;
 
-        self.file_handles
-            .lock()
-            .unwrap()
-            .insert(fh, remote_id);
+        self.file_handles.lock().unwrap().insert(fh, remote_id);
 
         lock.set(fh);
 
@@ -423,17 +421,13 @@ impl Filesystem for GdriveFs {
             return;
         }
 
-        let remote_id = fs_entry.unwrap().id;
-        let file_handle = self.make_file_handle(remote_id.clone());
+        let fs_entry = fs_entry.unwrap();
+        let remote_id = fs_entry.id.clone();
+        let file_handle = self.make_file_handle(remote_id);
         reply.opened(file_handle, flags);
 
-        // if we are in write-only mode, we don't need to warm up the read cache
-        if (flags as i32) & libc::O_WRONLY > 0 {
-            return;
-        }
-
-        // If the file was opened in read mode, we want to make sure we already start caching chunks of the file
-        //self.cache.warmup_key(remote_id);
+        // Create virtual chunks of the file to speed up downloading
+        self.cache.lock().unwrap().initialize_chunks(fs_entry);
     }
 
     fn read(
@@ -464,23 +458,21 @@ impl Filesystem for GdriveFs {
         // we wouldn't know and still have an active file handle which could lead to a lot of problems.
         let file_entry = self.repository.find_entry_by_id(&remote_id).unwrap();
 
+        // When we know the size is 0, we can reply directly without investing the HTTP(s) overhead to fetch 0 bytes from remote.
         if file_entry.size == 0 {
             reply.data(&[]);
             return;
         }
 
-        dbg!(
-            _offset as u64,
-            std::cmp::min(_offset + _size as i64, file_entry.size) as u64 - 1
-        );
-
-        let data = self.cache.get_chunk(
+        let cache = &mut *self.cache.lock().unwrap();
+        let data = cache.get_bytes_blocking(
             remote_id,
-            _offset as u64,
-            std::cmp::min(_size as i64, file_entry.size) as u32,
+            _offset,
+            std::cmp::min((_offset as u32 + _size - 1) as i64, file_entry.size),
         );
 
         if data.is_err() {
+            log::error!("Failed to read bytes from cache: {:?}", data.unwrap_err());
             reply.error(libc::EIO);
             return;
         }
