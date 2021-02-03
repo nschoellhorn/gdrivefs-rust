@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::ops::Add;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -31,14 +31,14 @@ pub(crate) struct GdriveFs {
     drive_client: Arc<DriveClient>,
     pending_writes: HashMap<u64, Vec<u8>>,
     users_cache: UsersCache,
-    cache: Arc<RwLock<DataCache>>,
+    cache: Arc<DataCache>,
 }
 
 impl GdriveFs {
     pub(crate) fn new(
         repository: Arc<FilesystemRepository>,
         drive_client: Arc<DriveClient>,
-        cache: Arc<RwLock<DataCache>>,
+        cache: Arc<DataCache>,
     ) -> Self {
         Self {
             repository,
@@ -427,7 +427,7 @@ impl Filesystem for GdriveFs {
         reply.opened(file_handle, flags);
 
         // Create virtual chunks of the file to speed up downloading
-        self.cache.lock().unwrap().initialize_chunks(fs_entry);
+        self.cache.initialize_chunks(fs_entry);
     }
 
     fn read(
@@ -464,8 +464,8 @@ impl Filesystem for GdriveFs {
             return;
         }
 
-        let cache = &mut *self.cache.lock().unwrap();
-        let data = cache.get_bytes_blocking(
+        log::info!("Locking for get_bytes_blocking()");
+        let data = self.cache.get_bytes_blocking(
             remote_id,
             _offset,
             std::cmp::min((_offset as u32 + _size - 1) as i64, file_entry.size),

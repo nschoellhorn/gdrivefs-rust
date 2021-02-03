@@ -5,7 +5,7 @@ extern crate diesel_migrations;
 #[macro_use]
 extern crate lazy_static;
 
-use std::{io::stdin, sync::Mutex};
+use std::io::stdin;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
@@ -103,11 +103,11 @@ async fn main() -> Result<()> {
     // We ignore the result here because we will receive UniqueConstraintViolations on each but the first launch
     let _ = state_repository.init_state(my_drive_meta.id.as_str(), RemoteType::OwnDrive);
 
-    let cache = Arc::new(RwLock::new(DataCache::new(
+    let cache = Arc::new(DataCache::new(
         Arc::clone(&drive_client),
         connection_pool.clone(),
         config.clone(),
-    )));
+    ));
     let filesystem = GdriveFs::new(
         Arc::clone(&repository),
         Arc::clone(&drive_client),

@@ -24,6 +24,13 @@ impl ObjectCacheChunkRepository {
             .expect("Unable to fetch chunks for given file id.")
     }
 
+    pub(crate) fn set_chunk_complete(&self, chunk_id: i64) -> Result<usize> {
+        Ok(diesel::update(
+            object_chunk.filter(id.eq(chunk_id))
+        ).set(is_complete.eq(true))
+            .execute(&self.connection.get().unwrap())?)
+    }
+
     pub fn insert_chunks(&self, chunks: Vec<NewObjectChunk>) {
         let connection = self.connection.get().unwrap();
         let _ = connection.transaction::<_, anyhow::Error, _>(|| {
@@ -42,18 +49,20 @@ impl ObjectCacheChunkRepository {
         diesel::sql_query(
             r#"
 select * from object_chunk where id between (
-  select id from object_chunk where byte_from <= ? order by abs(byte_from - ?) asc
+  select id from object_chunk where byte_from <= ? and file_id = ? order by abs(byte_from - ?) asc
 ) and (
-  select id from object_chunk where byte_to >= ? order by abs(byte_to - ?) asc
+  select id from object_chunk where byte_to >= ? and file_id = ? order by abs(byte_to - ?) asc
 );
         "#,
         )
-        .bind::<diesel::sql_types::BigInt, _>(from)
-        .bind::<diesel::sql_types::BigInt, _>(from)
-        .bind::<diesel::sql_types::BigInt, _>(to)
-        .bind::<diesel::sql_types::BigInt, _>(to)
-        .load::<ObjectChunk>(&self.connection.get().unwrap())
-        .expect("Unable to find chunks for given range.")
+            .bind::<diesel::sql_types::BigInt, _>(from)
+            .bind::<diesel::sql_types::Text, _>(rid)
+            .bind::<diesel::sql_types::BigInt, _>(from)
+            .bind::<diesel::sql_types::BigInt, _>(to)
+            .bind::<diesel::sql_types::Text, _>(rid)
+            .bind::<diesel::sql_types::BigInt, _>(to)
+            .load::<ObjectChunk>(&self.connection.get().unwrap())
+            .expect("Unable to find chunks for given range.")
     }
 
     pub fn find_chunk_by_object_name(&self, name: &str) -> Option<ObjectChunk> {

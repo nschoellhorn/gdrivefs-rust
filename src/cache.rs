@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::Path};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::{Arc, Condvar, Mutex};
 
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
@@ -20,6 +20,7 @@ use crate::{
     },
     drive_client::DriveClient,
 };
+use std::cell::RefCell;
 
 pub(crate) struct DataCache {
     object_dir: Box<Path>,
@@ -27,45 +28,73 @@ pub(crate) struct DataCache {
     pub chunk_repository: ObjectCacheChunkRepository,
     pub drive_client: Arc<DriveClient>,
     config: Config,
-    pub waiting_chunks: HashMap<String, Arc<(Mutex<bool>, Condvar)>>,
+    pub waiting_chunks: Mutex<RefCell<HashMap<String, Arc<(Mutex<bool>, Condvar)>>>>,
     pub chunk_notifier: Arc<Notify>,
 }
 
-pub(crate) fn run_download_worker(cache: Arc<RwLock<DataCache>>) -> JoinHandle<()> {
+pub(crate) fn run_download_worker(cache: Arc<DataCache>) -> JoinHandle<()> {
     tokio::spawn(async move {
-        // Prio no 1 are the chunks someone's waiting for, so do them first
-        let (waiting_chunks, drive_client) = {
-            let lock = cache.read().unwrap();
+        let notifier = Arc::clone(&cache.chunk_notifier);
 
-            let waiting_chunks = lock.waiting_chunks.clone();
-            let drive_client = Arc::clone(&lock.drive_client);
+        loop {
+            log::info!("Processing chunk download requests");
+            // Prio no 1 are the chunks someone's waiting for, so do them first
+            let (waiting_chunks, drive_client) = {
+                // TODO: maybe change this? probably not the most efficient way of doing this.
+                let waiting_chunks = cache.waiting_chunks.lock().unwrap().borrow().clone();
+                let drive_client = Arc::clone(&cache.drive_client);
 
-            (waiting_chunks, drive_client)
-        };
-
-        for (key, value) in waiting_chunks {
-            let chunk = {
-                let lock = cache.read().unwrap();
-                lock.chunk_repository
-                    .find_chunk_by_object_name(key.as_str())
-                    .expect("Chunk not found")
+                (waiting_chunks, drive_client)
             };
 
-            let result = drive_client
-                .get_file_content(
-                    chunk.file_id.as_str(),
-                    chunk.byte_from as u64,
-                    chunk.byte_to as u64,
-                )
-                .await;
+            for (key, value) in waiting_chunks {
+                let chunk = cache.chunk_repository
+                    .find_chunk_by_object_name(key.as_str())
+                    .expect("Chunk not found");
 
-            match result {
-                Ok(bytes) => {
-                    // TODO: Save the chunk data to disk, notify the waiting tasks, update database info
-                    log::info!("Successfully downloaded a chunk!")
+                log::info!("Downloading chunk data for chunk {} / file {}", chunk.id, chunk.file_id.as_str());
+
+                let result = drive_client
+                    .get_file_content(
+                        chunk.file_id.as_str(),
+                        chunk.byte_from as u64,
+                        chunk.byte_to as u64,
+                    )
+                    .await;
+
+                match result {
+                    Ok(bytes) => {
+                        // overwrite (or create) the chunk file with the data we've fetched
+                        let object_file_path = cache.object_dir.join(chunk.object_name);
+                        dbg!(&object_file_path);
+                        let mut file = std::fs::OpenOptions::new()
+                            .write(true)
+                            .create(true)
+                            .truncate(true)
+                            .open(object_file_path)
+                            .expect("Unable to open cache chunk file for write.");
+
+                        file.write_all(bytes.as_ref()).expect("Failed to write to chunk file.");
+                        cache.chunk_repository.set_chunk_complete(chunk.id).expect("Failed to update chunk metadata");
+
+                        let (mutex, condvar) = &*value;
+
+                        let mut is_complete = mutex.lock().unwrap();
+                        *is_complete = true;
+
+                        condvar.notify_all();
+
+                        cache.waiting_chunks.lock().unwrap().borrow_mut().remove(key.as_str());
+
+                        log::info!("Successfully downloaded a chunk!")
+                    }
+                    Err(error) => log::error!("Failed to download chunk: {:?}", error),
                 }
-                Err(error) => log::error!("Failed to download chunk: {:?}", error),
             }
+
+            // Instead of spin-looping, wait until someone has a new request that we can process
+            log::info!("Processed all open chunk download requests, waiting for new ones.");
+            notifier.notified().await;
         }
     })
 }
@@ -86,7 +115,7 @@ impl DataCache {
             chunk_repository: ObjectCacheChunkRepository::new(connection),
             drive_client,
             config,
-            waiting_chunks: HashMap::new(),
+            waiting_chunks: Mutex::new(RefCell::new(HashMap::new())),
             chunk_notifier: Arc::new(Notify::new()),
         };
 
@@ -142,10 +171,11 @@ impl DataCache {
         }
 
         self.chunk_repository.insert_chunks(chunks);
+        self.chunk_notifier.notify_one();
     }
 
     pub fn get_bytes_blocking(
-        &mut self,
+        &self,
         file_id: String,
         byte_from: i64,
         byte_to: i64,
@@ -192,22 +222,27 @@ impl DataCache {
         Ok(buffer.freeze())
     }
 
-    fn wait_for_chunk(&mut self, chunk: &ObjectChunk) {
+    fn wait_for_chunk(&self, chunk: &ObjectChunk) {
         // maybe other parts of the program already wait for this chunk,
         // so make sure that we don't create a new condvar if there's one already
-        let arc = if let Some(tuple_arc) = self.waiting_chunks.get(&chunk.object_name) {
-            Arc::clone(tuple_arc)
+        let result = {
+            self.waiting_chunks.lock().unwrap().borrow().get(&chunk.object_name).cloned()
+        };
+        let arc = if let Some(tuple_arc) = result {
+            Arc::clone(&tuple_arc)
         } else {
             let mutex = Mutex::new(false);
             let condvar = Condvar::new();
             let arc = Arc::new((mutex, condvar));
 
             // if nobody was waiting, we insert the chunk into the list of awaited chunks ourselves :)
-            self.waiting_chunks
+            self.waiting_chunks.lock().unwrap().borrow_mut()
                 .insert(chunk.object_name.clone(), Arc::clone(&arc));
 
             arc
         };
+
+        self.chunk_notifier.notify_one();
 
         let (mutex, condvar) = &*arc;
         let mut is_complete = mutex.lock().unwrap();
