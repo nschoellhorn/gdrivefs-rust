@@ -40,7 +40,7 @@ embed_migrations!("migrations/");
 async fn main() -> Result<()> {
     SimpleLogger::new()
         .with_level(log::LevelFilter::Info) // Everything from the libs shall be relatively silent
-        //.with_module_level("fuse", log::LevelFilter::Debug) // We want to debug native filesystem stuff
+        .with_module_level("fuse", log::LevelFilter::Debug) // We want to debug native filesystem stuff
         .with_module_level(module_path!(), log::LevelFilter::Debug) // For our own crate, we want to "DEBUG"
         .init()
         .unwrap();

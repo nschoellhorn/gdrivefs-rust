@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use chrono::{NaiveDateTime, Utc};
 use fuse::{
-    FileAttr, Filesystem, FileType, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
 use users::{Groups, Users, UsersCache};
@@ -543,7 +543,7 @@ impl Filesystem for GdriveFs {
                 reply.entry(&TTL, &attr, 1);
             }
             Err(err) => {
-                log::error!("Unexpected API error while creating a file: {:?}", err);
+                log::error!("Unexpected API error while creating a directory: {:?}", err);
                 reply.error(libc::EIO);
             }
         }
