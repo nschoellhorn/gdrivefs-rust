@@ -185,7 +185,7 @@ impl DataCache {
         let mut chunks = Vec::with_capacity(chunk_amount);
         for chunk_index in 0..chunk_amount {
             let byte_from = chunk_index * chunk_size;
-            let byte_to = std::cmp::min(byte_from + chunk_size, size);
+            let byte_to = std::cmp::min(byte_from + chunk_size - 1, size);
 
             let mut hasher = Sha256::new();
             hasher.update(format!("{}_c{}", entry.id, chunk_index));

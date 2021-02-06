@@ -4,7 +4,6 @@ CREATE TABLE object_chunk (
     chunk_sequence INTEGER NOT NULL,
     last_read INTEGER,
     last_write INTEGER,
-    cached_size INTEGER NOT NULL,
     byte_from INTEGER NOT NULL,
     byte_to INTEGER NOT NULL,
     is_complete INTEGER CHECK(is_complete IN (0, 1)) NOT NULL DEFAULT 0,
@@ -22,3 +21,6 @@ CREATE INDEX object_chunk_to_index
 
 CREATE INDEX object_chunk_name_index
     on object_chunk (object_name);
+
+CREATE INDEX object_chunk_complete_index
+    on object_chunk (is_complete);
