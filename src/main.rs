@@ -56,9 +56,6 @@ async fn main() -> Result<()> {
         &config_dir.to_str().expect("Str")
     );
 
-    let lock_file = config_dir.join("streamdrive.lock");
-    let is_first_launch = !lock_file.exists();
-
     let config: Config = confy::load_path(&config_dir.join("config.toml"))
         .expect("Unable to read configuration file.");
 
@@ -125,30 +122,13 @@ async fn main() -> Result<()> {
 
     cache::run_download_worker(cache);
 
-    if is_first_launch {
-        tokio::spawn(async move {
-            // We are starting up the full indexing procedure, so create the lock file (and close it again)
-            let _ = std::fs::File::create(lock_file);
+    drive_index
+        .update_drives()
+        .await
+        .expect("Updating drives failed.");
 
-            drive_index
-                .update_drives()
-                .await
-                .expect("Updating drives failed.");
-            drive_index
-                .refresh_full()
-                .await
-                .expect("Full indexing failed.");
-
-            // Make sure we get live updates about all the changes to the drive
-            drive_index
-                .start_background_indexing()
-                .await
-                .expect("Failed to incrementally index the drives.");
-        });
-    } else {
-        // Make sure we get live updates about all the changes to the drive
-        drive_index.start_background_indexing();
-    }
+    // Make sure we get live updates about all the changes to the drive
+    drive_index.start_background_indexing();
 
     log::info!(
         "Indexing finished, mounting filesystem on {}.",
