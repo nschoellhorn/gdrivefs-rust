@@ -3,13 +3,13 @@ use std::ffi::OsStr;
 
 use anyhow::Result;
 use chrono::NaiveDateTime;
+use diesel::{select, SqliteConnection};
 use diesel::dsl::{exists, max};
 use diesel::prelude::*;
 use diesel::r2d2::{ConnectionManager, Pool};
-use diesel::{select, SqliteConnection};
 
-use crate::database::schema::filesystem::dsl::*;
 use crate::database::schema::filesystem;
+use crate::database::schema::filesystem::dsl::*;
 
 use super::entity::{EntryType, FilesystemEntry, RemoteType};
 

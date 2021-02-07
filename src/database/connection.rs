@@ -1,4 +1,5 @@
 use diesel::connection::SimpleConnection;
+
 #[derive(Debug)]
 pub struct ConnectionOptions {
     pub enable_wal: bool,

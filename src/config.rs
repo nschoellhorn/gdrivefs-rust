@@ -32,17 +32,16 @@ impl Default for IndexingConfig {
 #[derive(Deserialize, Serialize, Clone)]
 pub struct CacheConfig {
     pub data_path: String,
+    pub capacity: usize,
+    pub chunk_size: usize,
 }
 
 impl Default for CacheConfig {
     fn default() -> Self {
         CacheConfig {
-            data_path: cache_dir()
-                .unwrap()
-                .join("StreamDrive")
-                .to_str()
-                .unwrap()
-                .to_string(),
+            data_path: cache_dir().unwrap().to_str().unwrap().to_string(),
+            capacity: 1024,              // Default is 1 GB of cache space.
+            chunk_size: 1024 * 1024 * 2, // Default is 2 MB chunks
         }
     }
 }
