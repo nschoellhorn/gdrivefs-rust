@@ -1,4 +1,3 @@
-use core::panic;
 use std::cell::RefCell;
 use std::sync::Arc;
 
@@ -28,10 +27,8 @@ use crate::{
 
 #[derive(Debug)]
 pub(crate) enum IndexChange {
-    RemoteChange(Change),
     RemoteChangeList(ChangeList, String),
     FileCreate(FilesystemEntry),
-    InstantChange(Box<IndexChange>),
 }
 
 pub(crate) struct IndexWriter {
@@ -147,12 +144,6 @@ impl IndexWorker {
 
     async fn worker_loop(&mut self) {
         while let Some(change) = self.receiver.recv().await {
-            if let IndexChange::InstantChange(actual_change) = change {
-                // If the change type is InstantChange, we want to process it instantly instead of batching it.
-                Self::process_change(*actual_change, &self.repository, &self.state_repository);
-                continue;
-            }
-
             let changes_length: usize = {
                 let batch = self.batch.lock().await;
                 let mut mut_batch = batch.borrow_mut();
@@ -224,10 +215,6 @@ impl IndexWorker {
             batch
                 .changes
                 .into_iter()
-                .filter(|change| match change {
-                    IndexChange::RemoteChange(remote_change) => remote_change.r#type == "file",
-                    _ => true,
-                })
                 .for_each(|change| Self::process_change(change, repository, state_repository));
 
             Ok(())
@@ -240,9 +227,6 @@ impl IndexWorker {
         state_repository: &IndexStateRepository,
     ) {
         match change {
-            IndexChange::RemoteChange(change) => {
-                Self::process_remote_change(change, repository);
-            }
             IndexChange::RemoteChangeList(change_list, drive_id) => {
                 log::trace!("Processing change list");
                 change_list
@@ -286,12 +270,6 @@ impl IndexWorker {
             IndexChange::FileCreate(mut file) => {
                 file.inode = repository.get_largest_inode() + 1;
                 repository.create_entry(&file);
-            }
-            IndexChange::InstantChange(actual_change) => {
-                if let IndexChange::InstantChange(_) = actual_change.as_ref() {
-                    // This could probably lead to recursion and should not be the case, so break out of it - better safe than sorry.
-                    panic!("Logical flaw detected. InstantChange contains InstantChange.");
-                }
             }
         }
     }
@@ -382,20 +360,9 @@ impl IndexWorker {
     }
 }
 
-struct IndexFetcher {
-    drive_client: Arc<DriveClient>,
-}
-
-impl IndexFetcher {
-    fn new(drive_client: Arc<DriveClient>) -> Self {
-        IndexFetcher { drive_client }
-    }
-}
-
 pub struct DriveIndex {
     drive_client: Arc<DriveClient>,
     change_publisher: Sender<IndexChange>,
-    writer_handle: JoinHandle<()>,
     fs_repository: FilesystemRepository,
     shared_drives_inode: u64,
     config: Config,
@@ -409,12 +376,11 @@ impl DriveIndex {
         config: Config,
         shared_drives_inode: u64,
     ) -> Self {
-        let (handle, publisher) = IndexWriter::new(pool.clone(), config.clone()).launch();
+        let (_, publisher) = IndexWriter::new(pool.clone(), config.clone()).launch();
 
         Self {
             drive_client,
             change_publisher: publisher,
-            writer_handle: handle,
             fs_repository: FilesystemRepository::new(pool.clone()),
             shared_drives_inode,
             config,

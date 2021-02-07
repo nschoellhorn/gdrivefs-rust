@@ -1,17 +1,16 @@
-use std::collections::HashMap;
 use std::ffi::OsStr;
 
 use anyhow::Result;
 use chrono::NaiveDateTime;
-use diesel::{select, SqliteConnection};
 use diesel::dsl::{exists, max};
 use diesel::prelude::*;
 use diesel::r2d2::{ConnectionManager, Pool};
+use diesel::{select, SqliteConnection};
 
 use crate::database::schema::filesystem;
 use crate::database::schema::filesystem::dsl::*;
 
-use super::entity::{EntryType, FilesystemEntry, RemoteType};
+use super::entity::{FilesystemEntry, RemoteType};
 
 #[derive(Clone)]
 pub struct FilesystemRepository {
@@ -41,30 +40,12 @@ impl FilesystemRepository {
         connection.transaction(f)
     }
 
-    pub(crate) fn get_all_drive_ids(&self) -> Vec<String> {
-        filesystem
-            .select(id)
-            .filter(entry_type.eq(EntryType::Drive))
-            .load::<String>(&self.connection.get().unwrap())
-            .expect("Unable to fetch known drives")
-    }
-
     pub(crate) fn get_all_shared_drive_ids(&self) -> Vec<String> {
         filesystem
             .select(id)
             .filter(remote_type.eq(RemoteType::TeamDrive))
             .load::<String>(&self.connection.get().unwrap())
             .expect("Unable to fetch known drives")
-    }
-
-    pub(crate) fn find_parent_id(&self, i: String) -> Option<String> {
-        filesystem
-            .select(parent_id)
-            .filter(id.eq(i))
-            .first::<Option<String>>(&self.connection.get().unwrap())
-            .optional()
-            .expect("Unable to search for parent inode")
-            .flatten()
     }
 
     pub(crate) fn find_inode_by_remote_id(&self, rid: &str) -> Option<i64> {
@@ -75,30 +56,6 @@ impl FilesystemRepository {
             .first::<i64>(&self.connection.get().unwrap())
             .optional()
             .expect("Error searching filesystem entry")
-    }
-
-    pub(crate) fn get_remote_inode_mapping(&self) -> HashMap<String, i64> {
-        filesystem
-            .select((id, inode))
-            .load::<(String, i64)>(&self.connection.get().unwrap())
-            .expect("Unable to load cached remote inode mapping")
-            .into_iter()
-            .collect()
-    }
-
-    pub(crate) fn find_parent_inode(&self, child_i: i64) -> Option<i64> {
-        diesel::sql_query(
-            "select parent.* from filesystem as parent
-                                join filesystem as child on (child.parent_id = parent.id)
-                                where child.inode = ?",
-        )
-        .bind::<diesel::sql_types::BigInt, _>(child_i)
-        .load::<FilesystemEntry>(&self.connection.get().unwrap())
-        .optional()
-        .expect("Error searching filesystem entry")
-        .map(|vec| vec.into_iter().next())
-        .flatten()
-        .map(|entry| entry.inode)
     }
 
     pub(crate) fn update_entry_by_inode(
@@ -141,13 +98,21 @@ impl FilesystemRepository {
             .execute(&self.connection.get().unwrap())?)
     }
 
-    pub(crate) fn update_last_access_by_inode(&self, ino: i64, access_time: NaiveDateTime) -> Result<usize> {
+    pub(crate) fn update_last_access_by_inode(
+        &self,
+        ino: i64,
+        access_time: NaiveDateTime,
+    ) -> Result<usize> {
         Ok(diesel::update(filesystem.filter(inode.eq(ino)))
             .set(last_accessed_at.eq(access_time))
             .execute(&self.connection.get().unwrap())?)
     }
 
-    pub(crate) fn update_last_modification_by_inode(&self, ino: i64, modification_time: NaiveDateTime) -> Result<usize> {
+    pub(crate) fn update_last_modification_by_inode(
+        &self,
+        ino: i64,
+        modification_time: NaiveDateTime,
+    ) -> Result<usize> {
         Ok(diesel::update(filesystem.filter(inode.eq(ino)))
             .set(last_modified_at.eq(modification_time))
             .execute(&self.connection.get().unwrap())?)
@@ -181,7 +146,12 @@ impl FilesystemRepository {
         diesel::insert_into(filesystem)
             .values(fs_entry)
             .execute(&self.connection.get().unwrap())
-            .unwrap_or_else(|_| panic!("Unable to insert new entry: {}#{}", fs_entry.name, fs_entry.id));
+            .unwrap_or_else(|_| {
+                panic!(
+                    "Unable to insert new entry: {}#{}",
+                    fs_entry.name, fs_entry.id
+                )
+            });
     }
 
     pub(crate) fn find_entry_by_id(&self, rid: &str) -> Option<FilesystemEntry> {

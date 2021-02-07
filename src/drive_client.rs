@@ -1,17 +1,15 @@
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use futures::future::{FutureExt, LocalBoxFuture};
 use hyper::client::HttpConnector;
 use hyper_rustls::HttpsConnector;
-use reqwest::{Client, header, RequestBuilder};
+use reqwest::{header, Client, RequestBuilder};
 use serde::{Deserialize, Serialize};
-use yup_oauth2::{InstalledFlowAuthenticator, InstalledFlowReturnMethod};
 use yup_oauth2::authenticator::Authenticator;
+use yup_oauth2::{InstalledFlowAuthenticator, InstalledFlowReturnMethod};
 
 use crate::{config::Config, database::entity::RemoteType};
 
@@ -185,16 +183,6 @@ impl DriveClient {
             .header(header::AUTHORIZATION, format!("Bearer {}", token))
     }
 
-    fn get_authenticated_blocking(&self, url: &str) -> reqwest::blocking::RequestBuilder {
-        let lock = self.token.lock().unwrap();
-        let token = lock.take();
-        lock.set(token.clone());
-
-        self.blocking_client
-            .get(format!("{}{}", *GDRIVE_BASE_URL, url).as_str())
-            .header(header::AUTHORIZATION, format!("Bearer {}", token))
-    }
-
     fn delete_authenticated_blocking(&self, url: &str) -> reqwest::blocking::RequestBuilder {
         let lock = self.token.lock().unwrap();
         let token = lock.take();
@@ -203,58 +191,6 @@ impl DriveClient {
         self.blocking_client
             .delete(format!("{}{}", *GDRIVE_BASE_URL, url).as_str())
             .header(header::AUTHORIZATION, format!("Bearer {}", token))
-    }
-
-    pub(crate) fn process_folder_recursively<'a, F>(
-        &'a self,
-        parent_id: String,
-        callback: &'a impl Fn(File) -> F,
-    ) -> LocalBoxFuture<'a, Result<()>>
-    where
-        F: Future<Output = Result<()>>,
-    {
-        async move {
-            let files = self
-                .get_files_in_parent(&parent_id)
-                .await
-                .expect("Unable to get files in drive.");
-            let mut tasks = vec![];
-            let mut tasks2 = vec![];
-            files.into_iter().for_each(|file| {
-                tasks.push(callback(file.clone()));
-
-                if file.mime_type == "application/vnd.google-apps.folder" {
-                    tasks2.push(self.process_folder_recursively(file.id, callback));
-                }
-            });
-
-            for task in tasks {
-                task.await?;
-            }
-
-            for task in tasks2 {
-                task.await?;
-            }
-
-            Ok(())
-        }
-        .boxed_local()
-    }
-
-    pub async fn get_start_page_token(&self, drive_id: &str) -> Result<String> {
-        Ok(self
-            .get_authenticated("/changes/startPageToken")
-            .await?
-            .query(&vec![
-                ("driveId", drive_id),
-                ("supportsAllDrives", "true"),
-                ("fields", "startPageToken"),
-            ])
-            .send()
-            .await?
-            .json::<StartPageToken>()
-            .await?
-            .start_page_token)
     }
 
     pub fn create_file(&self, create_request: FileCreateRequest) -> Result<File> {
@@ -406,63 +342,16 @@ impl DriveClient {
             .header("Range", format!("bytes={}-{}", byte_from, byte_to).as_str())
             .query(&params);
 
-        let response = request.send().await.context("Network failure or something")?;
+        let response = request
+            .send()
+            .await
+            .context("Network failure or something")?;
         if !response.status().is_success() {
             dbg!(response.text().await?);
             return Err(anyhow::Error::msg("Something went wrong"));
         }
 
         Ok(response.bytes().await?)
-    }
-
-    pub async fn get_files_in_parent(&self, parent_id: &str) -> Result<Vec<File>> {
-        let mut all_files = vec![];
-
-        let mut has_more = true;
-        let mut page_token: Option<String> = None;
-
-        let query = format!("\"{}\" in parents", parent_id);
-
-        // instead of making the user responsible of fetching all pages, we just give him a vector with all the files.
-        // this means, that we need to do the page handling ourselves.
-        while has_more {
-            let mut request = self.get_authenticated("/files").await?;
-            let mut params = vec![
-                ("supportsAllDrives".to_string(), "true".to_string()),
-                ("corpora".to_string(), "allDrives".to_string()),
-                ("includeItemsFromAllDrives".to_string(), "true".to_string()),
-                (
-                    "orderBy".to_string(),
-                    "folder desc, createdTime".to_string(),
-                ),
-                (
-                    "fields".to_string(),
-                    "files(id, name, mimeType, parents, createdTime, modifiedTime, size)"
-                        .to_string(),
-                ),
-                ("pageSize".to_string(), "1000".to_string()),
-                ("q".to_string(), query.clone()),
-            ]
-            .into_iter()
-            .collect::<HashMap<_, _>>();
-
-            if let Some(tok) = page_token.clone() {
-                params.insert("pageToken".to_string(), tok);
-            }
-
-            request = request.query(&params);
-            let mut files: FileList = request.send().await?.json().await?;
-            all_files.append(files.files.as_mut());
-
-            if let Some(new_page_token) = files.next_page_token {
-                has_more = true;
-                page_token = Some(new_page_token);
-            } else {
-                has_more = false;
-            }
-        }
-
-        Ok(all_files)
     }
 
     pub async fn get_drives(&self) -> Result<Vec<Drive>> {

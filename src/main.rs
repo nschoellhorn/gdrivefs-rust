@@ -7,7 +7,7 @@ extern crate lazy_static;
 
 use std::io::stdin;
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use anyhow::Result;
 use diesel_migrations::run_pending_migrations;
