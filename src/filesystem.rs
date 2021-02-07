@@ -23,6 +23,8 @@ use crate::{
 };
 
 const TTL: Duration = Duration::from_secs(1);
+const ROOT_INODE: u64 = 1;
+const SHARED_DRIVES_INODE: u64 = 2;
 
 pub(crate) struct GdriveFs {
     repository: Arc<FilesystemRepository>,
@@ -71,7 +73,7 @@ impl GdriveFs {
             ctime: modified,
             crtime: created,
             kind,
-            perm: 0o700,
+            perm: entry.mode as u16,
             nlink: 2,
             uid,
             gid,
@@ -219,6 +221,14 @@ impl Filesystem for GdriveFs {
         _flags: u32,
         reply: ReplyCreate,
     ) {
+        // We cannot support creating folders/files in the root or shared drives directory, so
+        //  we reply with "permission denied". Possibly, we could map create() calls in the shared
+        //  drives directory to the "Create Shared Drive" API call on Google later.
+        if parent_inode == ROOT_INODE || parent_inode == SHARED_DRIVES_INODE {
+            reply.error(libc::EPERM);
+            return;
+        }
+
         let parent_directory = self.repository.find_entry_for_inode(parent_inode);
 
         if parent_directory.is_none() {
@@ -308,11 +318,22 @@ impl Filesystem for GdriveFs {
         reply.written(_data.len() as u32);
     }
 
-    fn rmdir(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, reply: ReplyEmpty) {
-        self.unlink(_req, _parent, _name, reply)
+    fn rmdir(&mut self, _req: &Request<'_>, parent_inode: u64, _name: &OsStr, reply: ReplyEmpty) {
+        // removing the "meta" directories and removing shared drives isn't supported
+        if parent_inode == ROOT_INODE || parent_inode == SHARED_DRIVES_INODE {
+            reply.error(libc::EPERM);
+            return;
+        }
+
+        self.unlink(_req, parent_inode, _name, reply)
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent_ino: u64, name: &OsStr, reply: ReplyEmpty) {
+        if parent_ino == ROOT_INODE || parent_ino == SHARED_DRIVES_INODE {
+            reply.error(libc::EPERM);
+            return;
+        }
+
         let entry = self.repository.find_entry_as_child(parent_ino as i64, name);
 
         if entry.is_none() {
@@ -495,6 +516,11 @@ impl Filesystem for GdriveFs {
         mode: u32,
         reply: ReplyEntry,
     ) {
+        if parent_inode == ROOT_INODE || parent_inode == SHARED_DRIVES_INODE {
+            reply.error(libc::EPERM);
+            return;
+        }
+
         let parent_directory = self.repository.find_entry_for_inode(parent_inode);
 
         if parent_directory.is_none() {
