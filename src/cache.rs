@@ -222,7 +222,7 @@ impl DataCache {
         // zero out the buffer to make sure its fully initialized (length == capacity)
         buffer.resize(buffer.capacity(), 0);
 
-        let mut buffer_pointer = 0;
+        let mut buffer_cursor = 0;
         for chunk in chunks {
             // if the download of the chunk has not been completed, we need to wait on it
             if !chunk.is_complete {
@@ -237,7 +237,7 @@ impl DataCache {
                 0
             } as u64;
 
-            let sub_slice = &mut buffer[buffer_pointer..end];
+            let sub_slice = &mut buffer[buffer_cursor..end];
             let mut object_file = File::open(self.object_dir.join(chunk.object_name))
                 .context("Unable to open cache file")?;
 
@@ -249,7 +249,7 @@ impl DataCache {
                 .read_exact(sub_slice)
                 .context("Unable to read from cache file.")?;
 
-            buffer_pointer += end;
+            buffer_cursor += end;
         }
 
         Ok(buffer.freeze())
