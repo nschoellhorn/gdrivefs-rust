@@ -53,7 +53,6 @@ pub struct ObjectChunk {
     pub chunk_sequence: i32,
     pub last_read: Option<NaiveDateTime>,
     pub last_write: Option<NaiveDateTime>,
-    pub cached_size: i64,
     pub byte_from: i64,
     pub byte_to: i64,
     pub is_complete: bool,
@@ -65,7 +64,6 @@ pub struct ObjectChunk {
 pub struct NewObjectChunk {
     pub file_id: String,
     pub chunk_sequence: i32,
-    pub cached_size: i64,
     pub byte_from: i64,
     pub byte_to: i64,
     pub object_name: String,

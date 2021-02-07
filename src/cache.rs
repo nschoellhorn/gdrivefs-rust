@@ -195,7 +195,6 @@ impl DataCache {
             let new_chunk = NewObjectChunk {
                 file_id: entry.id.clone(),
                 chunk_sequence: chunk_index as i32,
-                cached_size: (byte_to - byte_from + 1) as i64,
                 byte_from: byte_from as i64,
                 byte_to: byte_to as i64,
                 object_name,

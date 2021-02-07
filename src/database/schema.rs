@@ -39,7 +39,6 @@ table! {
         chunk_sequence -> Integer,
         last_read -> Nullable<Timestamp>,
         last_write -> Nullable<Timestamp>,
-        cached_size -> BigInt,
         byte_from -> BigInt,
         byte_to -> BigInt,
         is_complete -> Bool,
