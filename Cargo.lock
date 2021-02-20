@@ -105,9 +105,9 @@ checksum = "ad1f8e949d755f9d79112b5bb46938e0ef9d3804a0b16dfab13aafcaa5f0fa72"
 
 [[package]]
 name = "cc"
-version = "1.0.58"
+version = "1.0.66"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9a06fb2e53271d7c279ec1efea6ab691c35a2ae67ec0d91d7acec0caf13b518"
+checksum = "4c0496836a84f8d0495758516b8621a622beb77c0fed418570e50764093ced48"
 
 [[package]]
 name = "cfg-if"
@@ -347,7 +347,6 @@ dependencies = [
 [[package]]
 name = "fuse"
 version = "0.4.0-dev"
-source = "git+https://github.com/delehef/fuse-rs/?branch=master#f9e41e8078bde7a9f8e16eb2413bbabb562fc706"
 dependencies = [
  "fuse-abi",
  "fuse-sys",
@@ -359,12 +358,10 @@ dependencies = [
 [[package]]
 name = "fuse-abi"
 version = "0.4.0-dev"
-source = "git+https://github.com/delehef/fuse-rs/?branch=master#f9e41e8078bde7a9f8e16eb2413bbabb562fc706"
 
 [[package]]
 name = "fuse-sys"
 version = "0.4.0-dev"
-source = "git+https://github.com/delehef/fuse-rs/?branch=master#f9e41e8078bde7a9f8e16eb2413bbabb562fc706"
 dependencies = [
  "pkg-config",
 ]
@@ -485,6 +482,7 @@ dependencies = [
  "libc",
  "log",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "sha2",
@@ -1139,9 +1137,9 @@ dependencies = [
 
 [[package]]
 name = "ring"
-version = "0.16.15"
+version = "0.16.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "952cd6b98c85bbc30efa1ba5783b8abf12fec8b3287ffa52605b9432313e34e4"
+checksum = "3053cf52e236a3ed746dfc745aa9cacf1b791d846bdaf412f60a8d7d6e17c8fc"
 dependencies = [
  "cc",
  "libc",
