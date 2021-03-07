@@ -345,25 +345,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "fuse"
-version = "0.4.0-dev"
+name = "fuser"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74928cf021619b0612e45c3a5332e9a5302c6739b7b5eaecd835ba620c346e0d"
 dependencies = [
- "fuse-abi",
- "fuse-sys",
  "libc",
  "log",
- "thread-scoped",
-]
-
-[[package]]
-name = "fuse-abi"
-version = "0.4.0-dev"
-
-[[package]]
-name = "fuse-sys"
-version = "0.4.0-dev"
-dependencies = [
+ "page_size",
  "pkg-config",
+ "users",
 ]
 
 [[package]]
@@ -473,7 +464,7 @@ dependencies = [
  "diesel-derive-enum",
  "diesel_migrations",
  "dirs",
- "fuse",
+ "fuser",
  "futures",
  "hex",
  "hyper",
@@ -895,6 +886,16 @@ dependencies = [
  "libc",
  "pkg-config",
  "vcpkg",
+]
+
+[[package]]
+name = "page_size"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eebde548fbbf1ea81a99b128872779c437752fb99f217c45245e1a61dcd9edcd"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]
@@ -1412,12 +1413,6 @@ dependencies = [
  "remove_dir_all",
  "winapi",
 ]
-
-[[package]]
-name = "thread-scoped"
-version = "1.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bcbb6aa301e5d3b0b5ef639c9a9c7e2f1c944f177b460c04dc24c69b1fa2bd99"
 
 [[package]]
 name = "time"
