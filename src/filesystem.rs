@@ -37,7 +37,8 @@ struct PendingWrite {
 struct FileHandle {
     handle: u64,
     file_id: String,
-    upload_id: String,
+    mode: FileMode,
+    upload_id: Option<String>,
 }
 
 impl PartialEq for FileHandle {
@@ -46,6 +47,28 @@ impl PartialEq for FileHandle {
     }
 }
 impl Eq for FileHandle {}
+
+#[derive(Copy, Clone, Eq, PartialEq, Hash)]
+struct FileMode {
+    pub read: bool,
+    pub write: bool,
+}
+
+impl FileMode {
+    fn from_flags(flags: i32) -> Result<Self> {
+        let (read, write) = match flags & libc::O_ACCMODE {
+            libc::O_RDONLY => (true, false),
+            libc::O_WRONLY => (false, true),
+            libc::O_RDWR => (true, true),
+            // Exactly one access mode flag must be specified
+            _ => {
+                return Err(anyhow::anyhow!("Invalid access flags: {}", flags));
+            }
+        };
+
+        Ok(Self { read, write })
+    }
+}
 
 pub(crate) struct GdriveFs {
     repository: Arc<FilesystemRepository>,
@@ -113,17 +136,23 @@ impl GdriveFs {
         }
     }
 
-    fn make_file_handle(&self, remote_id: String) -> u64 {
+    fn make_file_handle(&self, remote_id: String, mode: FileMode) -> u64 {
         let lock = self.latest_file_handle.lock().unwrap();
         let fh = lock.get() + 1;
 
         self.file_handles.lock().unwrap().insert(
             fh,
             FileHandle {
-                upload_id: self
-                    .drive_client
-                    .prepare_resumable_upload(remote_id.as_str())
-                    .unwrap(),
+                upload_id: if mode.write {
+                    Some(
+                        self.drive_client
+                            .prepare_resumable_upload(remote_id.as_str())
+                            .unwrap(),
+                    )
+                } else {
+                    None
+                },
+                mode,
                 file_id: remote_id,
                 handle: fh,
             },
@@ -148,7 +177,7 @@ impl GdriveFs {
                 for pending_write in pending_writes {
                     // TODO: Make sure we also update the cached object files
                     self.drive_client.write_file_resumable(
-                        file_handle.upload_id.as_str(),
+                        file_handle.upload_id.as_ref().unwrap().as_str(),
                         pending_write.offset,
                         pending_write.data.as_ref(),
                     )?;
@@ -272,7 +301,8 @@ impl Filesystem for GdriveFs {
         reply: ReplyCreate,
     ) {
         // We cannot support creating folders/files in the root or shared drives directory, so
-        //  we reply with "permission denied". Possibly, we could map create() calls in the shared
+        //  we reply with "permission denied".
+        //  TODO: Possibly, we could map create() calls in the shared
         //  drives directory to the "Create Shared Drive" API call on Google later.
         if parent_inode == ROOT_INODE || parent_inode == SHARED_DRIVES_INODE {
             reply.error(libc::EPERM);
@@ -321,7 +351,8 @@ impl Filesystem for GdriveFs {
                     .find_entry_by_id(&remote_id)
                     .expect("Freshly created entry is missing. That sucks.");
                 let attr = self.get_attr(&cache_entry);
-                let handle = self.make_file_handle(remote_id);
+                let handle =
+                    self.make_file_handle(remote_id, FileMode::from_flags(_flags).unwrap());
 
                 reply.created(&TTL, &attr, 1, handle, 0);
             }
@@ -507,7 +538,7 @@ impl Filesystem for GdriveFs {
 
         let fs_entry = fs_entry.unwrap();
         let remote_id = fs_entry.id.clone();
-        let file_handle = self.make_file_handle(remote_id);
+        let file_handle = self.make_file_handle(remote_id, FileMode::from_flags(flags).unwrap());
         reply.opened(file_handle, 0);
 
         // Create virtual chunks of the file to speed up downloading
