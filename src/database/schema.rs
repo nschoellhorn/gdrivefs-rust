@@ -43,5 +43,6 @@ table! {
         byte_to -> BigInt,
         is_complete -> Bool,
         object_name -> Text,
+        is_dirty -> Bool,
     }
 }

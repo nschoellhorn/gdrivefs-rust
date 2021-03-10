@@ -38,7 +38,6 @@ struct FileHandle {
     handle: u64,
     file_id: String,
     mode: FileMode,
-    upload_id: Option<String>,
 }
 
 impl PartialEq for FileHandle {
@@ -143,15 +142,6 @@ impl GdriveFs {
         self.file_handles.lock().unwrap().insert(
             fh,
             FileHandle {
-                upload_id: if mode.write {
-                    Some(
-                        self.drive_client
-                            .prepare_resumable_upload(remote_id.as_str())
-                            .unwrap(),
-                    )
-                } else {
-                    None
-                },
                 mode,
                 file_id: remote_id,
                 handle: fh,
@@ -164,21 +154,18 @@ impl GdriveFs {
     }
 
     fn flush_handle(&mut self, handle: u64) -> Result<()> {
-        match self
-            .pending_writes
-            .remove(self.file_handles.lock().unwrap().get(&handle).unwrap())
-        {
-            Some(pending_writes) => {
-                log::info!("Flushing data to Google.");
+        let guard = self.file_handles.lock().unwrap();
+        let handle = guard.get(&handle).unwrap();
 
-                let guard = self.file_handles.lock().unwrap();
-                let file_handle = guard.get(&handle).unwrap();
+        match self.pending_writes.remove(handle) {
+            Some(pending_writes) => {
+                log::info!("Flushing data to disk cache.");
 
                 for pending_write in pending_writes {
-                    // TODO: Make sure we also update the cached object files
-                    self.drive_client.write_file_resumable(
-                        file_handle.upload_id.as_ref().unwrap().as_str(),
-                        pending_write.offset,
+                    // Instead of writing directly to Google, we write the data to the cache and let the synchronizer catch up some time later.
+                    self.cache.write_bytes(
+                        handle.file_id.as_str(),
+                        pending_write.offset as i64,
                         pending_write.data.as_ref(),
                     )?;
                 }
@@ -573,7 +560,7 @@ impl Filesystem for GdriveFs {
 
         let remote_id = file_handle.file_id.as_str();
         // TODO: handle possible race condition when the file gets deleted on the remote side. In that case
-        // we wouldn't know and still have an active file handle which could lead to a lot of problems.
+        //  we wouldn't know and still have an active file handle which could lead to a lot of problems.
         let file_entry = self.repository.find_entry_by_id(remote_id).unwrap();
 
         // When we know the size is 0, we can reply directly without investing the HTTP(s) overhead to fetch 0 bytes from remote.

@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Condvar, Mutex};
 use std::{collections::HashMap, path::Path};
@@ -45,14 +45,14 @@ pub(crate) fn run_download_worker(cache: Arc<DataCache>) -> JoinHandle<()> {
                     .find_chunk_by_object_name(key.as_str())
                     .expect("Chunk not found");
 
-                let _ = cache.update_cache_content(chunk).await;
+                let _ = cache.update_cache_content_from_remote(chunk).await;
             }
 
             // after we've downloaded all the waiting chunks, we can now keep downloading the
             // backlog of chunks we've accumulated. We do that one by one since it's possible that
             // while we're downloading them, there will be chunks queued into `waiting_chunks`
             if let Some(chunk) = cache.chunk_repository.find_next_incomplete_chunk() {
-                let _ = cache.update_cache_content(chunk).await;
+                let _ = cache.update_cache_content_from_remote(chunk).await;
             }
 
             let has_incomplete_chunks = cache.chunk_repository.has_incomplete_chunks();
@@ -106,7 +106,7 @@ impl DataCache {
             .collect()
     }
 
-    pub async fn update_cache_content(&self, chunk: ObjectChunk) -> Result<()> {
+    pub async fn update_cache_content_from_remote(&self, chunk: ObjectChunk) -> Result<()> {
         log::info!(
             "Downloading chunk data for chunk {} / file {}",
             chunk.id,
@@ -207,6 +207,79 @@ impl DataCache {
         self.chunk_notifier.notify_one();
     }
 
+    pub fn write_bytes(&self, file_id: &str, byte_from: i64, data: &[u8]) -> Result<()> {
+        // Writing bytes to the chunk files is not as easy as it seems. It is possible that:
+        //  - either the bytes to be written span multiple files, which is semi-trivial
+        //  - or the bytes just belong to one specific chunk, which is trivial
+        //  - or the bytes exceed the last chunk's current size, which is semi-trivial
+        //  - or the bytes exceed the last chunk's current size and also the max chunk size, which is non-trivial
+
+        dbg!("write_bytes()");
+        dbg!(byte_from);
+
+        let byte_to = byte_from + data.len() as i64;
+
+        // Check if we find matching chunk(s) that fit all the bytes we want to write
+        let chunks = self
+            .chunk_repository
+            .find_chunks_for_range(file_id, byte_from, byte_to);
+
+        dbg!(chunks.len());
+        // if the length of the result is 1, we are in luck: we can fit all the bytes in one chunk, so this is pretty straight-forward
+        if chunks.len() == 1 {
+            let chunk = chunks.get(0).unwrap();
+            let mut object_file = OpenOptions::new()
+                .write(true)
+                .open(self.object_dir.join(chunk.object_name.as_str()))
+                .context("Unable to open chunk file for writing")?;
+
+            object_file
+                .seek(SeekFrom::Start((byte_from - chunk.byte_from) as u64))
+                .context("Unable to seek through cache file")?;
+            object_file
+                .write_all(data)
+                .context("Unable to write to cache file.")?;
+
+            self.chunk_repository.mark_chunk_dirty(chunk.id);
+
+            return Ok(());
+        }
+
+        // The bytes to be written span multiple chunks, but all of them exist and have a size that fits the bytes
+        if chunks.len() > 1 {
+            let mut data_cursor = 0usize;
+            for chunk in chunks {
+                dbg!(data_cursor);
+
+                let relative_start = if byte_from > chunk.byte_from {
+                    byte_from - chunk.byte_from
+                } else {
+                    0
+                } as u64;
+
+                let mut object_file = OpenOptions::new()
+                    .write(true)
+                    .open(self.object_dir.join(chunk.object_name))
+                    .context("Unable to open cache file")?;
+
+                object_file
+                    .seek(SeekFrom::Start(relative_start))
+                    .context("Failed to seek to relative start")?;
+
+                let data_end = std::cmp::min(data.len(), chunk.byte_to as usize - data_cursor);
+                object_file
+                    .write_all(&data[data_cursor..data_end])
+                    .context("Unable to write to cache file.")?;
+
+                self.chunk_repository.mark_chunk_dirty(chunk.id);
+
+                data_cursor += data_end;
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn get_bytes_blocking(&self, file_id: &str, byte_from: i64, byte_to: i64) -> Result<Bytes> {
         // to read bytes, we first need to figure out in which chunks the requested range is saved
         let chunks = self
@@ -232,9 +305,10 @@ impl DataCache {
                 0
             } as u64;
 
-            let sub_slice = &mut buffer[buffer_cursor..end];
             let mut object_file = File::open(self.object_dir.join(chunk.object_name))
                 .context("Unable to open cache file")?;
+            let sub_slice = &mut buffer
+                [buffer_cursor..std::cmp::min(end, object_file.metadata().unwrap().len() as usize)];
 
             object_file
                 .seek(SeekFrom::Start(relative_start))

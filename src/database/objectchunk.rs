@@ -33,6 +33,13 @@ impl ObjectCacheChunkRepository {
             .expect("Failed to fetch incomplete chunks")
     }
 
+    pub fn mark_chunk_dirty(&self, chunk_id: i64) {
+        diesel::update(object_chunk.filter(id.eq(chunk_id)))
+            .set(is_dirty.eq(true))
+            .execute(&self.connection.get().unwrap())
+            .expect("Failed to mark chunk dirty.");
+    }
+
     pub fn has_incomplete_chunks(&self) -> bool {
         select(exists(object_chunk.filter(is_complete.eq(false))))
             .get_result(&self.connection.get().unwrap())

@@ -78,6 +78,11 @@ pub struct FileCreateRequest {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PrepareResumableUploadRequest {
+    id: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Drive {
     pub id: String,
@@ -168,21 +173,6 @@ impl DriveClient {
             .header(header::AUTHORIZATION, format!("Bearer {}", token))
     }
 
-    fn upload_put_authenticated_blocking(
-        &self,
-        url: &str,
-        body: Vec<u8>,
-    ) -> reqwest::blocking::RequestBuilder {
-        let lock = self.token.lock().unwrap();
-        let token = lock.take();
-        lock.set(token.clone());
-
-        self.blocking_client
-            .put(format!("{}{}", *GDRIVE_UPLOAD_BASE_URL, url).as_str())
-            .body(body)
-            .header(header::AUTHORIZATION, format!("Bearer {}", token))
-    }
-
     fn upload_authenticated_blocking(
         &self,
         url: &str,
@@ -223,14 +213,25 @@ impl DriveClient {
     }
 
     pub fn prepare_resumable_upload(&self, file_id: &str) -> Result<String> {
-        let response = self
-            .upload_put_authenticated_blocking(&format!("/files/{}", file_id), Vec::new())
+        let lock = self.token.lock().unwrap();
+        let token = lock.take();
+        lock.set(token.clone());
+
+        // Make sure to free the lock before we send the request to avoid deadlocks or performance
+        // issues
+        drop(lock);
+
+        let request = self
+            .blocking_client
+            .patch(format!("{}{}/{}", *GDRIVE_UPLOAD_BASE_URL, "/files", file_id).as_str())
+            .header(header::AUTHORIZATION, format!("Bearer {}", token))
             .query(&vec![
                 ("uploadType", "resumable"),
                 ("supportsAllDrives", "true"),
             ])
-            .header(header::CONTENT_LENGTH, "0")
-            .send()?;
+            .header(header::CONTENT_LENGTH, "0");
+
+        let response = request.send()?;
 
         let response_headers = response.headers();
 
@@ -251,33 +252,32 @@ impl DriveClient {
     }
 
     pub fn write_file_resumable(&self, upload_id: &str, offset: u64, data: &[u8]) -> Result<()> {
-        let _ = self
-            .upload_put_authenticated_blocking("/files", data.to_vec())
+        let lock = self.token.lock().unwrap();
+        let token = lock.take();
+        lock.set(token.clone());
+
+        // Make sure to free the lock before we send the request to avoid deadlocks or performance
+        // issues
+        drop(lock);
+
+        let response = self
+            .blocking_client
+            .put(format!("{}{}", *GDRIVE_UPLOAD_BASE_URL, "/files").as_str())
             .query(&vec![("uploadType", "resumable"), ("upload_id", upload_id)])
             .header(header::CONTENT_LENGTH, &format!("{}", data.len()))
             .header(
                 header::RANGE,
                 &format!("bytes {}-{}/*", offset, offset + data.len() as u64 - 1),
             )
-            .send()?
-            .text()?;
-        Ok(())
-    }
-
-    pub fn write_file(&self, file_id: &str, data: &[u8]) -> Result<File> {
-        Ok(self
-            .upload_authenticated_blocking(&format!("/files/{}", file_id), data.to_vec())
+            .header(header::AUTHORIZATION, format!("Bearer {}", token))
             .query(&vec![
-                ("uploadType", "media"),
+                ("uploadType", "resumable"),
                 ("supportsAllDrives", "true"),
-                (
-                    "fields",
-                    "id, name, mimeType, parents, createdTime, modifiedTime, size, trashed",
-                ),
             ])
-            .header(header::CONTENT_LENGTH, &format!("{}", data.len()))
-            .send()?
-            .json::<File>()?)
+            .body(data.to_vec())
+            .send()?;
+
+        Ok(())
     }
 
     pub fn delete_file(&self, file_id: &str) -> Result<()> {

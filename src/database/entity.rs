@@ -57,6 +57,7 @@ pub struct ObjectChunk {
     pub byte_to: i64,
     pub is_complete: bool,
     pub object_name: String,
+    pub is_dirty: bool,
 }
 
 #[derive(Debug, Insertable)]

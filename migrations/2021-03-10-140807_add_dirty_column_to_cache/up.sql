@@ -1,0 +1,1 @@
+ALTER TABLE object_chunk ADD COLUMN is_dirty INTEGER CHECK(is_dirty IN (0, 1)) NOT NULL DEFAULT 0;
