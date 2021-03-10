@@ -21,17 +21,37 @@ use crate::{
     drive_client::FileCreateRequest,
     indexing::IndexWriter,
 };
+use bytes::{BufMut, Bytes, BytesMut};
 
 const TTL: Duration = Duration::from_secs(1);
 const ROOT_INODE: u64 = 1;
 const SHARED_DRIVES_INODE: u64 = 2;
 
+struct PendingWrite {
+    offset: u64,
+    data: Bytes,
+}
+
+#[derive(Hash, Clone)]
+struct FileHandle {
+    handle: u64,
+    file_id: String,
+    upload_id: String,
+}
+
+impl PartialEq for FileHandle {
+    fn eq(&self, other: &FileHandle) -> bool {
+        self.handle == other.handle
+    }
+}
+impl Eq for FileHandle {}
+
 pub(crate) struct GdriveFs {
     repository: Arc<FilesystemRepository>,
-    file_handles: Mutex<HashMap<u64, String>>,
+    file_handles: Mutex<HashMap<u64, FileHandle>>,
     latest_file_handle: Mutex<Cell<u64>>,
     drive_client: Arc<DriveClient>,
-    pending_writes: HashMap<u64, Vec<u8>>,
+    pending_writes: HashMap<FileHandle, Vec<PendingWrite>>,
     users_cache: UsersCache,
     cache: Arc<DataCache>,
 }
@@ -94,7 +114,17 @@ impl GdriveFs {
         let lock = self.latest_file_handle.lock().unwrap();
         let fh = lock.get() + 1;
 
-        self.file_handles.lock().unwrap().insert(fh, remote_id);
+        self.file_handles.lock().unwrap().insert(
+            fh,
+            FileHandle {
+                upload_id: self
+                    .drive_client
+                    .prepare_resumable_upload(remote_id.as_str())
+                    .unwrap(),
+                file_id: remote_id,
+                handle: fh,
+            },
+        );
 
         lock.set(fh);
 
@@ -102,13 +132,24 @@ impl GdriveFs {
     }
 
     fn flush_handle(&mut self, handle: u64) -> Result<()> {
-        match self.pending_writes.remove(&handle) {
-            Some(data) => {
+        match self
+            .pending_writes
+            .remove(self.file_handles.lock().unwrap().get(&handle).unwrap())
+        {
+            Some(pending_writes) => {
                 log::info!("Flushing data to Google.");
 
                 let guard = self.file_handles.lock().unwrap();
-                let file_id = guard.get(&handle).unwrap();
-                self.drive_client.write_file(file_id, data.as_slice())?;
+                let file_handle = guard.get(&handle).unwrap();
+
+                for pending_write in pending_writes {
+                    // TODO: Make sure we also update the cached object files
+                    self.drive_client.write_file_resumable(
+                        file_handle.upload_id.as_str(),
+                        pending_write.offset,
+                        pending_write.data.as_ref(),
+                    )?;
+                }
 
                 Ok(())
             }
@@ -164,7 +205,10 @@ impl Filesystem for GdriveFs {
     ) {
         log::info!("fsync() being called for inode {}", _ino);
 
-        if self.pending_writes.contains_key(&_fh) {
+        let lock = self.file_handles.lock().unwrap();
+        let file_handle = lock.get(&_fh);
+        if file_handle.is_some() && self.pending_writes.contains_key(file_handle.unwrap()) {
+            drop(lock);
             match self.flush_handle(_fh) {
                 Ok(_) => reply.ok(),
                 Err(_) => reply.error(libc::EIO),
@@ -188,8 +232,11 @@ impl Filesystem for GdriveFs {
     ) {
         log::info!("release() being called for inode {}", _ino);
 
-        if self.pending_writes.contains_key(&_fh) {
+        let mut lock = self.file_handles.lock().unwrap();
+        let file_handle = lock.get(&_fh);
+        if file_handle.is_some() && self.pending_writes.contains_key(file_handle.unwrap()) {
             log::info!("Pending writes detected, flushing.");
+            drop(lock);
             match self.flush_handle(_fh) {
                 Ok(_) => {
                     log::info!("Successfully flushed pending data.");
@@ -206,8 +253,7 @@ impl Filesystem for GdriveFs {
             return;
         }
 
-        let mut guard = self.file_handles.lock().unwrap();
-        guard.remove(&_fh);
+        lock.remove(&_fh);
 
         reply.ok();
     }
@@ -292,28 +338,30 @@ impl Filesystem for GdriveFs {
         _flags: u32,
         reply: ReplyWrite,
     ) {
+        let lock = self.file_handles.lock().unwrap();
+        let handle = if let Some(handle) = lock.get(&_fh) {
+            handle
+        } else {
+            reply.error(libc::ENOENT);
+            return;
+        };
+
         // We are limited by the backing Vec<> of pending changes here
         if (_offset as u64 + _data.len() as u64) > usize::MAX as u64 {
             reply.error(libc::E2BIG);
             return;
         }
 
-        let mut pending_data = self.pending_writes.remove(&_fh).unwrap_or_else(Vec::new);
+        let mut pending_data = self.pending_writes.remove(handle).unwrap_or_else(Vec::new);
+        let mut bytes = BytesMut::with_capacity(_data.len());
+        bytes.put_slice(_data);
 
-        let write_index = _offset as usize;
-        _data
-            .iter()
-            .cloned()
-            .enumerate()
-            .for_each(|(data_index, byte)| {
-                if write_index + data_index >= pending_data.len() {
-                    pending_data.push(byte);
-                } else {
-                    pending_data[write_index + data_index] = byte;
-                }
-            });
-
-        self.pending_writes.insert(_fh, pending_data);
+        let pending_write = PendingWrite {
+            offset: _offset as u64,
+            data: bytes.freeze(),
+        };
+        pending_data.push(pending_write);
+        self.pending_writes.insert(handle.clone(), pending_data);
 
         reply.written(_data.len() as u32);
     }
@@ -461,23 +509,24 @@ impl Filesystem for GdriveFs {
         reply: ReplyData,
     ) {
         let lock = self.file_handles.lock().unwrap();
-        let remote_id = lock.get(&_fh);
+        let file_handle = lock.get(&_fh);
 
-        if remote_id.is_none() {
+        if file_handle.is_none() {
             reply.error(libc::ENOENT);
             return;
         }
 
-        let remote_id = remote_id.unwrap().clone();
+        let file_handle = file_handle.unwrap();
 
         println!(
             "READ CALLED - Offset: {}, Size: {}, Inode: {}",
             _offset, _size, _ino
         );
 
+        let remote_id = file_handle.file_id.as_str();
         // TODO: handle possible race condition when the file gets deleted on the remote side. In that case
         // we wouldn't know and still have an active file handle which could lead to a lot of problems.
-        let file_entry = self.repository.find_entry_by_id(&remote_id).unwrap();
+        let file_entry = self.repository.find_entry_by_id(remote_id).unwrap();
 
         // When we know the size is 0, we can reply directly without investing the HTTP(s) overhead to fetch 0 bytes from remote.
         if file_entry.size == 0 {

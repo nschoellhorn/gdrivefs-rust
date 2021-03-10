@@ -168,6 +168,21 @@ impl DriveClient {
             .header(header::AUTHORIZATION, format!("Bearer {}", token))
     }
 
+    fn upload_put_authenticated_blocking(
+        &self,
+        url: &str,
+        body: Vec<u8>,
+    ) -> reqwest::blocking::RequestBuilder {
+        let lock = self.token.lock().unwrap();
+        let token = lock.take();
+        lock.set(token.clone());
+
+        self.blocking_client
+            .put(format!("{}{}", *GDRIVE_UPLOAD_BASE_URL, url).as_str())
+            .body(body)
+            .header(header::AUTHORIZATION, format!("Bearer {}", token))
+    }
+
     fn upload_authenticated_blocking(
         &self,
         url: &str,
@@ -205,6 +220,48 @@ impl DriveClient {
             ])
             .send()?
             .json::<File>()?)
+    }
+
+    pub fn prepare_resumable_upload(&self, file_id: &str) -> Result<String> {
+        let response = self
+            .upload_put_authenticated_blocking(&format!("/files/{}", file_id), Vec::new())
+            .query(&vec![
+                ("uploadType", "resumable"),
+                ("supportsAllDrives", "true"),
+            ])
+            .header(header::CONTENT_LENGTH, "0")
+            .send()?;
+
+        let response_headers = response.headers();
+
+        let upload_url = response_headers
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // we use a very primitive way of extracing the upload id. Should be fine and we dont need
+        // a new crate for this. Might be smart to change this to be more reliable when it first
+        // breaks.
+        //
+        // URL format is something like this: https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=xa298sd_sdlkj2
+        let upload_id = upload_url.rsplit("=").next().unwrap();
+        Ok(upload_id.to_string())
+    }
+
+    pub fn write_file_resumable(&self, upload_id: &str, offset: u64, data: &[u8]) -> Result<()> {
+        let _ = self
+            .upload_put_authenticated_blocking("/files", data.to_vec())
+            .query(&vec![("uploadType", "resumable"), ("upload_id", upload_id)])
+            .header(header::CONTENT_LENGTH, &format!("{}", data.len()))
+            .header(
+                header::RANGE,
+                &format!("bytes {}-{}/*", offset, offset + data.len() as u64 - 1),
+            )
+            .send()?
+            .text()?;
+        Ok(())
     }
 
     pub fn write_file(&self, file_id: &str, data: &[u8]) -> Result<File> {

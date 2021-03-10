@@ -207,16 +207,11 @@ impl DataCache {
         self.chunk_notifier.notify_one();
     }
 
-    pub fn get_bytes_blocking(
-        &self,
-        file_id: String,
-        byte_from: i64,
-        byte_to: i64,
-    ) -> Result<Bytes> {
+    pub fn get_bytes_blocking(&self, file_id: &str, byte_from: i64, byte_to: i64) -> Result<Bytes> {
         // to read bytes, we first need to figure out in which chunks the requested range is saved
-        let chunks =
-            self.chunk_repository
-                .find_chunks_for_range(file_id.as_str(), byte_from, byte_to);
+        let chunks = self
+            .chunk_repository
+            .find_chunks_for_range(file_id, byte_from, byte_to);
 
         let mut buffer = BytesMut::with_capacity((byte_to - byte_from + 1) as usize);
         // zero out the buffer to make sure its fully initialized (length == capacity)
