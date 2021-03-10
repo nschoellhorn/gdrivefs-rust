@@ -8,9 +8,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use chrono::{NaiveDateTime, Utc};
-use fuse::{
+use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyWrite, Request,
+    ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
 use users::{Groups, Users, UsersCache};
 
@@ -26,6 +26,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 const TTL: Duration = Duration::from_secs(1);
 const ROOT_INODE: u64 = 1;
 const SHARED_DRIVES_INODE: u64 = 2;
+const BLOCK_SIZE: u32 = 512;
 
 struct PendingWrite {
     offset: u64,
@@ -97,6 +98,8 @@ impl GdriveFs {
             nlink: 2,
             uid,
             gid,
+            blksize: BLOCK_SIZE,
+            padding: 0,
             rdev: 0,
             flags: 0,
         }
@@ -225,8 +228,8 @@ impl Filesystem for GdriveFs {
         _req: &Request<'_>,
         _ino: u64,
         _fh: u64,
-        _flags: u32,
-        _lock_owner: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
@@ -264,7 +267,8 @@ impl Filesystem for GdriveFs {
         parent_inode: u64,
         file_name: &OsStr,
         _mode: u32,
-        _flags: u32,
+        _umask: u32,
+        _flags: i32,
         reply: ReplyCreate,
     ) {
         // We cannot support creating folders/files in the root or shared drives directory, so
@@ -319,7 +323,7 @@ impl Filesystem for GdriveFs {
                 let attr = self.get_attr(&cache_entry);
                 let handle = self.make_file_handle(remote_id);
 
-                reply.created(&TTL, &attr, 1, handle, _flags);
+                reply.created(&TTL, &attr, 1, handle, 0);
             }
             Err(err) => {
                 log::error!("Unexpected API error while creating a file: {:?}", err);
@@ -335,7 +339,9 @@ impl Filesystem for GdriveFs {
         _fh: u64,
         _offset: i64,
         _data: &[u8],
-        _flags: u32,
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
         let lock = self.file_handles.lock().unwrap();
@@ -412,8 +418,9 @@ impl Filesystem for GdriveFs {
         _uid: Option<u32>,
         _gid: Option<u32>,
         size: Option<u64>,
-        atime: Option<SystemTime>,
-        mtime: Option<SystemTime>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
         _fh: Option<u64>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
@@ -443,6 +450,10 @@ impl Filesystem for GdriveFs {
             }
 
             if let Some(atime) = atime {
+                let atime = match atime {
+                    TimeOrNow::SpecificTime(time) => time,
+                    TimeOrNow::Now => SystemTime::now(),
+                };
                 let res = atime.duration_since(UNIX_EPOCH);
                 if let Ok(duration) = res {
                     self.repository.update_last_access_by_inode(
@@ -456,6 +467,10 @@ impl Filesystem for GdriveFs {
             }
 
             if let Some(mtime) = mtime {
+                let mtime = match mtime {
+                    TimeOrNow::SpecificTime(time) => time,
+                    TimeOrNow::Now => SystemTime::now(),
+                };
                 let res = mtime.duration_since(UNIX_EPOCH);
                 if let Ok(duration) = res {
                     self.repository.update_last_modification_by_inode(
@@ -482,7 +497,7 @@ impl Filesystem for GdriveFs {
         reply.attr(&TTL, &self.get_attr(&entry.unwrap()));
     }
 
-    fn open(&mut self, _req: &Request, _ino: u64, flags: u32, reply: ReplyOpen) {
+    fn open(&mut self, _req: &Request, _ino: u64, flags: i32, reply: ReplyOpen) {
         let fs_entry = self.repository.find_entry_for_inode(_ino);
 
         if fs_entry.is_none() {
@@ -493,7 +508,7 @@ impl Filesystem for GdriveFs {
         let fs_entry = fs_entry.unwrap();
         let remote_id = fs_entry.id.clone();
         let file_handle = self.make_file_handle(remote_id);
-        reply.opened(file_handle, flags);
+        reply.opened(file_handle, 0);
 
         // Create virtual chunks of the file to speed up downloading
         self.cache.initialize_chunks(fs_entry);
@@ -506,6 +521,8 @@ impl Filesystem for GdriveFs {
         _fh: u64,
         _offset: i64,
         _size: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
         let lock = self.file_handles.lock().unwrap();
@@ -563,6 +580,7 @@ impl Filesystem for GdriveFs {
         parent_inode: u64,
         file_name: &OsStr,
         mode: u32,
+        _umask: u32,
         reply: ReplyEntry,
     ) {
         if parent_inode == ROOT_INODE || parent_inode == SHARED_DRIVES_INODE {

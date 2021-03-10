@@ -137,7 +137,7 @@ async fn main() -> Result<()> {
 
     let mount_path = config.general.mount_path.clone();
     let handle = tokio::task::spawn_blocking(|| {
-        fuse::mount(filesystem, mount_path, &[]).expect("unable to mount FUSE filesystem");
+        fuser::mount(filesystem, mount_path, &[]).expect("unable to mount FUSE filesystem");
     });
 
     let mut input = String::new();
