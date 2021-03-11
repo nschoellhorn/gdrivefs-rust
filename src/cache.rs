@@ -198,6 +198,8 @@ impl DataCache {
                 byte_from: byte_from as i64,
                 byte_to: byte_to as i64,
                 object_name,
+                is_dirty: false,
+                is_complete: false,
             };
 
             chunks.push(new_chunk);
@@ -217,17 +219,19 @@ impl DataCache {
         dbg!("write_bytes()");
         dbg!(byte_from);
 
-        let byte_to = byte_from + data.len() as i64;
+        let byte_to = byte_from + data.len() as i64 - 1;
+        dbg!(byte_to);
 
         // Check if we find matching chunk(s) that fit all the bytes we want to write
         let chunks = self
             .chunk_repository
-            .find_chunks_for_range(file_id, byte_from, byte_to);
+            .find_exact_chunks_for_range(file_id, byte_from, byte_to);
 
         dbg!(chunks.len());
         // if the length of the result is 1, we are in luck: we can fit all the bytes in one chunk, so this is pretty straight-forward
         if chunks.len() == 1 {
             let chunk = chunks.get(0).unwrap();
+            dbg!(&chunk);
             let mut object_file = OpenOptions::new()
                 .write(true)
                 .open(self.object_dir.join(chunk.object_name.as_str()))
@@ -267,6 +271,7 @@ impl DataCache {
                     .context("Failed to seek to relative start")?;
 
                 let data_end = std::cmp::min(data.len(), chunk.byte_to as usize - data_cursor);
+                dbg!(data_end);
                 object_file
                     .write_all(&data[data_cursor..data_end])
                     .context("Unable to write to cache file.")?;
@@ -274,6 +279,159 @@ impl DataCache {
                 self.chunk_repository.mark_chunk_dirty(chunk.id);
 
                 data_cursor += data_end;
+            }
+
+            return Ok(());
+        }
+
+        // We have to write bytes that don't fit in the current chunks, so we either need to extend an existing one
+        //  or create a new one or even both.
+        if chunks.len() == 0 {
+            // We need all chunks from the starting point up to the currently last one
+            let mut chunks = self
+                .chunk_repository
+                .find_chunks_from_byte(file_id, byte_from);
+
+            // there is an edge case where we still dont find any chunks. This can happen when the
+            // starting point for our writing is after the the end of the currently last chunk.
+            // This should not happen very often, so for now we just violently fail here to monitor
+            // what the impact is.
+            // TODO: Improve this part so it doesn't generate mini chunks
+            if chunks.len() == 0 {
+                let new_byte_from = byte_from;
+                let new_byte_to = new_byte_from + self.config.cache.chunk_size as i64 - 1;
+
+                let chunk_index = self.chunk_repository.get_max_sequence_for_file(file_id) + 1;
+
+                let mut hasher = Sha256::new();
+                hasher.update(format!("{}_c{}", file_id, chunk_index));
+
+                let object_name = hex::encode(hasher.finalize());
+
+                let new_chunk = NewObjectChunk {
+                    file_id: String::from(file_id),
+                    chunk_sequence: chunk_index,
+                    byte_from: new_byte_from,
+                    byte_to: new_byte_to,
+                    object_name: object_name.clone(),
+                    is_dirty: true,
+                    is_complete: true,
+                };
+                self.chunk_repository.insert_chunks(vec![new_chunk]);
+
+                chunks.push(ObjectChunk {
+                    id: -1,
+                    last_read: None,
+                    last_write: None,
+                    is_complete: false,
+                    is_dirty: true,
+                    file_id: String::from(file_id),
+                    chunk_sequence: chunk_index,
+                    byte_from: new_byte_from,
+                    byte_to: new_byte_to,
+                    object_name,
+                });
+            }
+
+            // We can re-use nearly the same logic as above, but instead of stopping at the current
+            // chunk boundary, we allow extending the chunk boundary up to the maximum chunk size.
+            let mut data_cursor = 0usize;
+            let mut previous_chunk = chunks.first().unwrap().clone();
+            for chunk in &chunks {
+                dbg!(data_cursor);
+
+                let relative_start = if byte_from > chunk.byte_from {
+                    byte_from - chunk.byte_from
+                } else {
+                    0
+                } as u64;
+
+                let mut object_file = OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .open(self.object_dir.join(&chunk.object_name))
+                    .context("Unable to open cache file")?;
+
+                object_file
+                    .seek(SeekFrom::Start(relative_start))
+                    .context("Failed to seek to relative start")?;
+
+                let chunk_max_byte_to = std::cmp::max(
+                    chunk.byte_to as usize,
+                    chunk.byte_from as usize + self.config.cache.chunk_size,
+                );
+                dbg!(chunk_max_byte_to);
+                let data_end = std::cmp::min(data.len(), chunk_max_byte_to - data_cursor);
+                dbg!(data_end);
+                object_file
+                    .write_all(&data[data_cursor..data_end])
+                    .context("Unable to write to cache file.")?;
+
+                // Since we possibly extended the chunk, we need to recalculate the `byte_to` value
+                // for this chunk
+                let new_byte_to = chunk.byte_from + object_file.metadata().unwrap().len() as i64;
+                if new_byte_to != chunk.byte_to {
+                    self.chunk_repository
+                        .update_chunk_byte_to(chunk.id, new_byte_to);
+                }
+
+                self.chunk_repository.mark_chunk_dirty(chunk.id);
+
+                data_cursor += data_end;
+                previous_chunk = chunk.clone();
+            }
+
+            // We have written to (and possibly extended) all chunks that currently exist. Now we
+            // need to check if there's data left to write.
+            while data_cursor < (data.len() - 1) {
+                let new_byte_from = previous_chunk.byte_to + 1;
+                let new_byte_to = std::cmp::min(
+                    new_byte_from + self.config.cache.chunk_size as i64,
+                    byte_from + data.len() as i64,
+                );
+
+                let chunk_index = previous_chunk.chunk_sequence + 1;
+
+                let mut hasher = Sha256::new();
+                hasher.update(format!("{}_c{}", file_id, chunk_index));
+
+                let object_name = hex::encode(hasher.finalize());
+                let new_chunk = NewObjectChunk {
+                    file_id: String::from(file_id),
+                    chunk_sequence: chunk_index,
+                    byte_from: new_byte_from,
+                    byte_to: new_byte_to,
+                    object_name: object_name.clone(),
+                    is_dirty: true,
+                    is_complete: true,
+                };
+                self.chunk_repository.insert_chunks(vec![new_chunk]);
+
+                let mut object_file = OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .open(self.object_dir.join(&object_name))
+                    .unwrap();
+
+                let data_end = std::cmp::min(data.len(), new_byte_to as usize - data_cursor);
+                dbg!(data_end);
+                object_file
+                    .write_all(&data[data_cursor..data_end])
+                    .context("Unable to write to cache file.")?;
+
+                data_cursor += data_end;
+                previous_chunk = ObjectChunk {
+                    id: -1,
+                    last_read: None,
+                    last_write: None,
+                    is_complete: false,
+                    is_dirty: true,
+                    file_id: String::from(file_id),
+                    chunk_sequence: chunk_index,
+                    byte_from: new_byte_from,
+                    byte_to: new_byte_to,
+                    object_name,
+                }
             }
         }
 
@@ -284,7 +442,7 @@ impl DataCache {
         // to read bytes, we first need to figure out in which chunks the requested range is saved
         let chunks = self
             .chunk_repository
-            .find_chunks_for_range(file_id, byte_from, byte_to);
+            .find_exact_chunks_for_range(file_id, byte_from, byte_to);
 
         let mut buffer = BytesMut::with_capacity((byte_to - byte_from + 1) as usize);
         // zero out the buffer to make sure its fully initialized (length == capacity)

@@ -45,7 +45,7 @@ pub struct IndexState {
     pub remote_type: RemoteType,
 }
 
-#[derive(Debug, Queryable, QueryableByName)]
+#[derive(Debug, Queryable, QueryableByName, Clone)]
 #[table_name = "object_chunk"]
 pub struct ObjectChunk {
     pub id: i64,
@@ -68,4 +68,6 @@ pub struct NewObjectChunk {
     pub byte_from: i64,
     pub byte_to: i64,
     pub object_name: String,
+    pub is_dirty: bool,
+    pub is_complete: bool,
 }

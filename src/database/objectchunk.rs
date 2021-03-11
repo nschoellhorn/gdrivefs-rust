@@ -1,5 +1,5 @@
 use anyhow::Result;
-use diesel::dsl::exists;
+use diesel::dsl::{exists, max};
 use diesel::prelude::*;
 use diesel::{
     r2d2::{ConnectionManager, Pool},
@@ -52,6 +52,16 @@ impl ObjectCacheChunkRepository {
             .execute(&self.connection.get().unwrap())?)
     }
 
+    pub fn get_max_sequence_for_file(&self, rid: &str) -> i32 {
+        let largest_index: Option<i32> = object_chunk
+            .filter(file_id.eq(rid))
+            .select(max(chunk_sequence))
+            .first(&self.connection.get().unwrap())
+            .unwrap();
+
+        largest_index.unwrap_or(0)
+    }
+
     pub fn insert_chunks(&self, chunks: Vec<NewObjectChunk>) {
         let connection = self.connection.get().unwrap();
         let _ = connection.transaction::<_, anyhow::Error, _>(|| {
@@ -66,7 +76,35 @@ impl ObjectCacheChunkRepository {
         });
     }
 
-    pub fn find_chunks_for_range(&self, rid: &str, from: i64, to: i64) -> Vec<ObjectChunk> {
+    pub fn update_chunk_byte_to(&self, chunk_id: i64, to: i64) {
+        diesel::update(object_chunk.filter(id.eq(chunk_id)))
+            .set(byte_to.eq(to))
+            .execute(&self.connection.get().unwrap())
+            .expect("Failed to update byte_to for chunk");
+    }
+
+    pub fn find_chunks_from_byte(&self, rid: &str, from: i64) -> Vec<ObjectChunk> {
+        diesel::sql_query(
+            r#"
+select * from object_chunk where byte_from >= (
+	select byte_from from object_chunk
+	    where file_id = ?
+	    and byte_from <= ? 
+	    and (byte_from - ?) >= 0
+	    order by abs(byte_from - ?) limit 1
+) and file_id = ?;
+        "#,
+        )
+        .bind::<diesel::sql_types::Text, _>(rid)
+        .bind::<diesel::sql_types::BigInt, _>(from)
+        .bind::<diesel::sql_types::BigInt, _>(from)
+        .bind::<diesel::sql_types::BigInt, _>(from)
+        .bind::<diesel::sql_types::Text, _>(rid)
+        .load::<ObjectChunk>(&self.connection.get().unwrap())
+        .expect("Unable to find chunks for given range.")
+    }
+
+    pub fn find_exact_chunks_for_range(&self, rid: &str, from: i64, to: i64) -> Vec<ObjectChunk> {
         diesel::sql_query(
             r#"
 select * from object_chunk where id between (
