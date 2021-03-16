@@ -10,7 +10,7 @@ use anyhow::Result;
 use chrono::{NaiveDateTime, Utc};
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
+    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 use users::{Groups, Users, UsersCache};
 
@@ -22,7 +22,9 @@ use crate::{
     indexing::IndexWriter,
 };
 use bytes::{BufMut, Bytes, BytesMut};
+use chrono::serde::NanoSecondsTimestampVisitor;
 
+const MAX_NAME_LENGTH: u32 = 255;
 const TTL: Duration = Duration::from_secs(1);
 const ROOT_INODE: u64 = 1;
 const SHARED_DRIVES_INODE: u64 = 2;
@@ -107,17 +109,25 @@ impl GdriveFs {
         let uid = self.users_cache.get_current_uid();
         let gid = self.users_cache.get_current_gid();
 
+        let aligned_size = match kind {
+            FileType::Directory => BLOCK_SIZE as u64,
+            _ => entry.size as u64,
+        };
+
         FileAttr {
             ino: entry.inode as u64,
-            size: entry.size as u64,
-            blocks: 0,
+            size: aligned_size,
+            blocks: (aligned_size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64,
             atime: created, // 1970-01-01 00:00:00
             mtime: modified,
             ctime: modified,
             crtime: created,
             kind,
             perm: entry.mode as u16,
-            nlink: 2,
+            nlink: match kind {
+                FileType::Directory => 2,
+                _ => 1,
+            },
             uid,
             gid,
             blksize: BLOCK_SIZE,
@@ -158,8 +168,10 @@ impl GdriveFs {
         let handle = guard.get(&handle).unwrap();
 
         match self.pending_writes.remove(handle) {
-            Some(pending_writes) => {
-                log::info!("Flushing data to disk cache.");
+            Some(_) => {
+                log::info!("Flushing data to Google Drive.");
+
+                /*pending_writes.sort_by(|a, b| a.offset.cmp(&b.offset));
 
                 for pending_write in pending_writes {
                     // Instead of writing directly to Google, we write the data to the cache and let the synchronizer catch up some time later.
@@ -168,7 +180,12 @@ impl GdriveFs {
                         pending_write.offset as i64,
                         pending_write.data.as_ref(),
                     )?;
-                }
+                }*/
+
+                self.cache
+                    .chunk_repository
+                    .mark_all_chunks_dirty_for_file(handle.file_id.as_str());
+                self.cache.upload_notifier.notify_waiters();
 
                 Ok(())
             }
@@ -185,6 +202,11 @@ impl Filesystem for GdriveFs {
         entry_name: &OsStr,
         reply: ReplyEntry,
     ) {
+        log::debug!(
+            "lookup(parent_inode = {}, entry_name = {})",
+            parent_inode,
+            entry_name.to_str().unwrap()
+        );
         // We need to look up top level directories, which are the drives in our case
         let entry = self
             .repository
@@ -197,6 +219,7 @@ impl Filesystem for GdriveFs {
 
     fn getattr(&mut self, request: &Request, inode: u64, reply: ReplyAttr) {
         let entry = self.repository.find_entry_for_inode(inode);
+        log::debug!("getattr(inode = {}, entry = {:?})", inode, entry);
         match entry {
             Some(fs_entry) => reply.attr(&TTL, &self.get_attr(&fs_entry)),
             None => {
@@ -222,21 +245,34 @@ impl Filesystem for GdriveFs {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        log::info!("fsync() being called for inode {}", _ino);
-
         let lock = self.file_handles.lock().unwrap();
         let file_handle = lock.get(&_fh);
-        if file_handle.is_some() && self.pending_writes.contains_key(file_handle.unwrap()) {
-            drop(lock);
-            match self.flush_handle(_fh) {
-                Ok(_) => reply.ok(),
-                Err(_) => reply.error(libc::EIO),
+
+        match file_handle {
+            Some(handle) => {
+                log::debug!(
+                    "fsync(inode = {}, handle = {}, name = {})",
+                    _ino,
+                    _fh,
+                    handle.file_id.as_str()
+                );
+                if self.pending_writes.contains_key(handle) {
+                    drop(lock);
+                    match self.flush_handle(_fh) {
+                        Ok(_) => reply.ok(),
+                        Err(_) => reply.error(libc::EIO),
+                    }
+
+                    return;
+                }
+
+                reply.ok();
             }
-
-            return;
+            None => {
+                log::warn!("fsync(unknown)");
+                reply.error(libc::ENOENT);
+            }
         }
-
-        reply.ok();
     }
 
     fn release(
@@ -287,9 +323,16 @@ impl Filesystem for GdriveFs {
         _flags: i32,
         reply: ReplyCreate,
     ) {
+        let real_name = file_name.to_str().unwrap().to_string();
+        log::debug!("create(name = {})", real_name.as_str());
+
+        if _flags & libc::O_TRUNC > 0 {
+            unimplemented!("create(O_TRUNC) not supported.");
+        }
+
         // We cannot support creating folders/files in the root or shared drives directory, so
         //  we reply with "permission denied".
-        //  TODO: Possibly, we could map create() calls in the shared
+        // TODO: Possibly, we could map create() calls in the shared
         //  drives directory to the "Create Shared Drive" API call on Google later.
         if parent_inode == ROOT_INODE || parent_inode == SHARED_DRIVES_INODE {
             reply.error(libc::EPERM);
@@ -314,6 +357,7 @@ impl Filesystem for GdriveFs {
             .find_entry_as_child(parent_inode as i64, file_name)
             .is_some()
         {
+            log::debug!("create() called for existing file: {}", real_name);
             reply.error(libc::EEXIST);
             return;
         }
@@ -322,7 +366,7 @@ impl Filesystem for GdriveFs {
         let create_response = self.drive_client.create_file(FileCreateRequest {
             created_time: current_time,
             modified_time: current_time,
-            name: file_name.to_str().unwrap().to_string(),
+            name: real_name,
             parents: vec![parent_directory.id],
             mime_type: None,
         });
@@ -362,16 +406,26 @@ impl Filesystem for GdriveFs {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
+        log::debug!(
+            "write(inode = {}, handle = {}, offset = {}, write_flags = {}, flags = {})",
+            _ino,
+            _fh,
+            _offset,
+            _write_flags,
+            _flags
+        );
         let lock = self.file_handles.lock().unwrap();
         let handle = if let Some(handle) = lock.get(&_fh) {
             handle
         } else {
+            log::warn!("write(): invalid handle");
             reply.error(libc::ENOENT);
             return;
         };
 
         // We are limited by the backing Vec<> of pending changes here
         if (_offset as u64 + _data.len() as u64) > usize::MAX as u64 {
+            log::error!("write(): invalid offset/size - out of range.");
             reply.error(libc::E2BIG);
             return;
         }
@@ -387,6 +441,31 @@ impl Filesystem for GdriveFs {
         pending_data.push(pending_write);
         self.pending_writes.insert(handle.clone(), pending_data);
 
+        self.cache
+            .write_bytes(handle.file_id.as_str(), _offset, _data);
+
+        // if all chunks for this file are complete, we need to update the local metadata
+        if self.cache.is_fully_cached(handle.file_id.as_str()) {
+            log::debug!("Updating meta.");
+            let now = Utc::now().naive_utc();
+            self.repository
+                .update_last_modification_by_inode(_ino as i64, now.clone());
+            self.repository
+                .update_last_access_by_inode(_ino as i64, now);
+
+            let size_on_disk = self.cache.get_size_on_disk(handle.file_id.as_str()) as i64;
+            let entry = self
+                .repository
+                .find_entry_by_id(handle.file_id.as_str())
+                .unwrap();
+
+            if size_on_disk > entry.size {
+                log::debug!("Updating size from write()");
+                self.repository
+                    .update_size_by_inode(_ino as i64, size_on_disk);
+            }
+        }
+
         reply.written(_data.len() as u32);
     }
 
@@ -397,6 +476,12 @@ impl Filesystem for GdriveFs {
             return;
         }
 
+        log::debug!(
+            "rmdir(parent = {}, name = {})",
+            parent_inode,
+            _name.to_str().unwrap()
+        );
+
         self.unlink(_req, parent_inode, _name, reply)
     }
 
@@ -405,6 +490,12 @@ impl Filesystem for GdriveFs {
             reply.error(libc::EPERM);
             return;
         }
+
+        log::debug!(
+            "unlink(parent = {}, name = {})",
+            parent_ino,
+            name.to_str().unwrap()
+        );
 
         let entry = self.repository.find_entry_as_child(parent_ino as i64, name);
 
@@ -449,12 +540,13 @@ impl Filesystem for GdriveFs {
         // TODO: Figure out if it's smart to just swallow changes that we don't support or if it would be better to return something like ENOSYS
         //  not sure yet, whether ENOSYS would cause more problems than it would fix, so let's keep it like this for now.
 
-        let entry = self.repository.find_entry_for_inode(ino);
-
-        if entry.is_none() {
-            reply.error(libc::ENOENT);
-            return;
-        }
+        let entry = match self.repository.find_entry_for_inode(ino) {
+            Some(entry) => entry,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
 
         let update_result = self.repository.transaction::<_, anyhow::Error, _>(|| {
             if let Some(mode) = mode {
@@ -501,6 +593,25 @@ impl Filesystem for GdriveFs {
                 }
             }
 
+            if let Some(new_size) = size {
+                let file_id = entry.id.as_str();
+                let current_size = entry.size as u64;
+
+                log::debug!("resize(current = {}, new = {})", current_size, new_size);
+                if new_size > current_size {
+                    self.repository
+                        .update_size_by_inode(ino as i64, new_size as i64);
+
+                    let extra_bytes = (new_size - current_size) as usize;
+                    let mut data = Vec::with_capacity(extra_bytes);
+                    data.resize(extra_bytes, 0u8);
+                    self.cache
+                        .write_bytes(file_id, current_size as i64, data.as_slice());
+                } else {
+                    unimplemented!("resize() to shrink not supported.");
+                }
+            }
+
             Ok(())
         });
 
@@ -519,11 +630,27 @@ impl Filesystem for GdriveFs {
         let fs_entry = self.repository.find_entry_for_inode(_ino);
 
         if fs_entry.is_none() {
+            log::debug!("open(inode = {} name = UNKNOWN, flags = {})", _ino, flags);
             reply.error(libc::ENOENT);
             return;
         }
 
         let fs_entry = fs_entry.unwrap();
+        log::debug!(
+            "open(inode = {}, name = {}, flags = {})",
+            _ino,
+            fs_entry.name.as_str(),
+            flags
+        );
+
+        log::info!("open() being called for inode {}", _ino);
+        if flags & libc::O_CREAT != 0 {
+            unimplemented!("open() was called with O_CREAT!");
+        }
+        if flags & libc::O_TRUNC != 0 {
+            unimplemented!("open() was called with O_TRUNC!");
+        }
+
         let remote_id = fs_entry.id.clone();
         let file_handle = self.make_file_handle(remote_id, FileMode::from_flags(flags).unwrap());
         reply.opened(file_handle, 0);
@@ -553,9 +680,11 @@ impl Filesystem for GdriveFs {
 
         let file_handle = file_handle.unwrap();
 
-        println!(
+        log::debug!(
             "READ CALLED - Offset: {}, Size: {}, Inode: {}",
-            _offset, _size, _ino
+            _offset,
+            _size,
+            _ino
         );
 
         let remote_id = file_handle.file_id.as_str();
@@ -716,5 +845,36 @@ impl Filesystem for GdriveFs {
 
             reply.error(libc::ENOENT);
         }
+    }
+
+    fn access(&mut self, _req: &Request<'_>, _ino: u64, _mask: i32, reply: ReplyEmpty) {
+        reply.ok();
+    }
+
+    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
+        reply.statfs(
+            10,
+            10,
+            10,
+            1,
+            10,
+            BLOCK_SIZE as u32,
+            MAX_NAME_LENGTH,
+            BLOCK_SIZE as u32,
+        );
+    }
+
+    fn rename(
+        &mut self,
+        _req: &Request<'_>,
+        _parent: u64,
+        _name: &OsStr,
+        _newparent: u64,
+        _newname: &OsStr,
+        _flags: u32,
+        reply: ReplyEmpty,
+    ) {
+        reply.error(libc::EACCES);
+        unimplemented!("rename() not supported!");
     }
 }

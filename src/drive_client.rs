@@ -2,12 +2,13 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use hyper::client::HttpConnector;
 use hyper_rustls::HttpsConnector;
-use reqwest::{header, Client, RequestBuilder};
+use reqwest::{header, Client, RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use yup_oauth2::authenticator::Authenticator;
 use yup_oauth2::{InstalledFlowAuthenticator, InstalledFlowReturnMethod};
 
@@ -17,6 +18,12 @@ lazy_static! {
     static ref SCOPES: [&'static str; 1] = ["https://www.googleapis.com/auth/drive",];
     static ref GDRIVE_BASE_URL: &'static str = "https://www.googleapis.com/drive/v3";
     static ref GDRIVE_UPLOAD_BASE_URL: &'static str = "https://www.googleapis.com/upload/drive/v3";
+}
+
+#[derive(Debug, Clone)]
+pub struct ResumableUpload {
+    pub upload_url: String,
+    pub file_size: usize,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -98,6 +105,14 @@ struct StartPageToken {
     start_page_token: String,
 }
 
+#[derive(Error, Debug)]
+pub enum DriveError {
+    #[error("File not found")]
+    NotFound,
+    #[error("Unknown error: {0}")]
+    Unknown(anyhow::Error),
+}
+
 pub struct DriveClient {
     http_client: Client,
     blocking_client: reqwest::blocking::Client,
@@ -133,6 +148,27 @@ impl DriveClient {
         })
     }
 
+    pub fn set_size(&self, file_id: &str, new_size: u64) -> Result<()> {
+        let response = self
+            .patch_authenticated_blocking(&format!("/files/{}", file_id), &("size", new_size))
+            .query(&vec![
+                ("supportsAllDrives", "true"),
+                (
+                    "fields",
+                    "id, name, mimeType, parents, createdTime, modifiedTime, size, trashed",
+                ),
+            ])
+            .send()?;
+
+        log::debug!("set_size() response: {:?}", &response);
+
+        if !response.status().is_success() {
+            return Err(anyhow!("Non-200 error"));
+        }
+
+        Ok(())
+    }
+
     async fn get_token(&self) -> Result<String> {
         let token = self
             .authenticator
@@ -156,6 +192,24 @@ impl DriveClient {
     }
 
     fn post_authenticated_blocking<T>(
+        &self,
+        url: &str,
+        body: &T,
+    ) -> reqwest::blocking::RequestBuilder
+    where
+        T: Serialize + ?Sized,
+    {
+        let lock = self.token.lock().unwrap();
+        let token = lock.take();
+        lock.set(token.clone());
+
+        self.blocking_client
+            .post(format!("{}{}", *GDRIVE_BASE_URL, url).as_str())
+            .json(body)
+            .header(header::AUTHORIZATION, format!("Bearer {}", token))
+    }
+
+    fn patch_authenticated_blocking<T>(
         &self,
         url: &str,
         body: &T,
@@ -212,17 +266,21 @@ impl DriveClient {
             .json::<File>()?)
     }
 
-    pub fn prepare_resumable_upload(&self, file_id: &str) -> Result<String> {
-        let lock = self.token.lock().unwrap();
-        let token = lock.take();
-        lock.set(token.clone());
+    pub async fn prepare_resumable_upload(
+        &self,
+        file_id: &str,
+        file_size: usize,
+    ) -> Result<ResumableUpload> {
+        let token = {
+            let lock = self.token.lock().unwrap();
+            let token = lock.take();
+            lock.set(token.clone());
 
-        // Make sure to free the lock before we send the request to avoid deadlocks or performance
-        // issues
-        drop(lock);
+            token
+        };
 
         let request = self
-            .blocking_client
+            .http_client
             .patch(format!("{}{}/{}", *GDRIVE_UPLOAD_BASE_URL, "/files", file_id).as_str())
             .header(header::AUTHORIZATION, format!("Bearer {}", token))
             .query(&vec![
@@ -231,7 +289,9 @@ impl DriveClient {
             ])
             .header(header::CONTENT_LENGTH, "0");
 
-        let response = request.send()?;
+        let response = request.send().await?;
+
+        dbg!(&response);
 
         let response_headers = response.headers();
 
@@ -242,40 +302,48 @@ impl DriveClient {
             .unwrap()
             .to_string();
 
-        // we use a very primitive way of extracing the upload id. Should be fine and we dont need
-        // a new crate for this. Might be smart to change this to be more reliable when it first
-        // breaks.
-        //
-        // URL format is something like this: https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=xa298sd_sdlkj2
-        let upload_id = upload_url.rsplit("=").next().unwrap();
-        Ok(upload_id.to_string())
+        Ok(ResumableUpload {
+            upload_url,
+            file_size,
+        })
     }
 
-    pub fn write_file_resumable(&self, upload_id: &str, offset: u64, data: &[u8]) -> Result<()> {
-        let lock = self.token.lock().unwrap();
-        let token = lock.take();
-        lock.set(token.clone());
+    pub async fn write_file_resumable(
+        &self,
+        upload: &ResumableUpload,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        let token = {
+            let lock = self.token.lock().unwrap();
+            let token = lock.take();
+            lock.set(token.clone());
 
-        // Make sure to free the lock before we send the request to avoid deadlocks or performance
-        // issues
-        drop(lock);
+            token
+        };
 
-        let response = self
-            .blocking_client
-            .put(format!("{}{}", *GDRIVE_UPLOAD_BASE_URL, "/files").as_str())
-            .query(&vec![("uploadType", "resumable"), ("upload_id", upload_id)])
+        let request = self
+            .http_client
+            .put(upload.upload_url.as_str())
             .header(header::CONTENT_LENGTH, &format!("{}", data.len()))
             .header(
-                header::RANGE,
-                &format!("bytes {}-{}/*", offset, offset + data.len() as u64 - 1),
+                header::CONTENT_RANGE,
+                &format!(
+                    "bytes {}-{}/{}",
+                    offset,
+                    offset + data.len() as u64 - 1,
+                    upload.file_size
+                ),
             )
             .header(header::AUTHORIZATION, format!("Bearer {}", token))
             .query(&vec![
                 ("uploadType", "resumable"),
                 ("supportsAllDrives", "true"),
             ])
-            .body(data.to_vec())
-            .send()?;
+            .body(data.to_vec());
+        dbg!(&request);
+        let response = request.send().await?;
+        dbg!(response);
 
         Ok(())
     }
@@ -320,7 +388,7 @@ impl DriveClient {
         //  a team drive or the own drive, they will be displayed for the changes to "My Drive". So we need to filter
         //  out everything that's in trash right now. This needs to be changed if we want to support trash folder
         //  some day, but for now, that's not a problem.
-        let result = match remote_type {
+        /*let result = match remote_type {
             RemoteType::OwnDrive => {
                 let filtered_changes = parsed_response
                     .changes
@@ -336,9 +404,9 @@ impl DriveClient {
                 }
             }
             _ => parsed_response,
-        };
+        };*/
 
-        Ok(result)
+        Ok(parsed_response)
     }
 
     fn get_change_list_params<'a>(
@@ -389,7 +457,10 @@ impl DriveClient {
     ) -> Result<bytes::Bytes> {
         let request_url = format!("/files/{}", file_id);
         dbg!(&request_url);
-        let mut request = self.get_authenticated(request_url.as_str()).await?;
+        let mut request = self
+            .get_authenticated(request_url.as_str())
+            .await
+            .map_err(|err| DriveError::Unknown(err))?;
         let params = vec![
             ("alt".to_string(), "media".to_string()),
             ("supportsAllDrives".to_string(), "true".to_string()),
@@ -404,8 +475,13 @@ impl DriveClient {
             .await
             .context("Network failure or something")?;
         if !response.status().is_success() {
+            if response.status() == StatusCode::NOT_FOUND {
+                return Err(DriveError::NotFound.into());
+            }
+
             dbg!(response.text().await?);
-            return Err(anyhow::Error::msg("Something went wrong"));
+
+            return Err(anyhow!("Something went wrong"));
         }
 
         Ok(response.bytes().await?)

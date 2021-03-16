@@ -412,6 +412,7 @@ impl DriveIndex {
                 log::info!("Fetching new changes from Google Drive");
 
                 for state in self.state_repository.get_all_states().into_iter() {
+                    log::debug!("Fetching changes for drive {}", &state.drive_id);
                     self.process_pending_changes(state)
                         .await
                         .expect("Background indexing tick failed.");

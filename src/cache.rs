@@ -18,7 +18,7 @@ use crate::{
         entity::{FilesystemEntry, NewObjectChunk, ObjectChunk},
         objectchunk::ObjectCacheChunkRepository,
     },
-    drive_client::DriveClient,
+    drive_client::{DriveClient, DriveError},
 };
 use std::cell::RefCell;
 
@@ -29,12 +29,63 @@ pub(crate) struct DataCache {
     pub drive_client: Arc<DriveClient>,
     config: Config,
     pub waiting_chunks: Mutex<RefCell<HashMap<String, Arc<(Mutex<bool>, Condvar)>>>>,
-    pub chunk_notifier: Arc<Notify>,
+    pub download_notifier: Arc<Notify>,
+    pub upload_notifier: Arc<Notify>,
+}
+
+pub(crate) fn run_upload_worker(cache: Arc<DataCache>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let notifier = Arc::clone(&cache.upload_notifier);
+
+        loop {
+            log::info!("Uploading changed files to Google Drive");
+
+            for dirty_file in cache.chunk_repository.find_dirty_files() {
+                // For each dirty file, we need to prepare a resumable upload, then upload *all* chunks (not only the dirty ones),
+                // and then mark the file as complete & not dirty
+                let upload = cache
+                    .drive_client
+                    .prepare_resumable_upload(
+                        dirty_file.as_str(),
+                        cache.get_size_on_disk(dirty_file.as_str()),
+                    )
+                    .await
+                    .expect("Failed to prepare resumable upload.");
+
+                for chunk in cache
+                    .chunk_repository
+                    .find_chunks_by_file_id(dirty_file.as_str())
+                {
+                    log::info!("Uploading chunk {}", chunk.id);
+                    let mut file =
+                        std::fs::File::open(cache.object_dir.join(chunk.object_name)).unwrap();
+                    let mut data = Vec::with_capacity(file.metadata().unwrap().len() as usize);
+                    file.read_to_end(&mut data)
+                        .expect("Failed to read chunk file for uploading");
+                    cache
+                        .drive_client
+                        .write_file_resumable(&upload, chunk.byte_from as u64, data.as_slice())
+                        .await
+                        .expect("Failed to upload chunk");
+
+                    cache.chunk_repository.mark_chunk_clean(chunk.id);
+                }
+            }
+
+            let has_dirty_chunk = cache.chunk_repository.has_dirty_chunks();
+
+            if !has_dirty_chunk {
+                // Instead of spin-looping, wait until someone has a new request that we can process
+                log::info!("Processed all outstanding uploads. Waiting for new ones.");
+                notifier.notified().await;
+            }
+        }
+    })
 }
 
 pub(crate) fn run_download_worker(cache: Arc<DataCache>) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let notifier = Arc::clone(&cache.chunk_notifier);
+        let notifier = Arc::clone(&cache.download_notifier);
 
         loop {
             log::info!("Processing chunk download requests");
@@ -56,7 +107,7 @@ pub(crate) fn run_download_worker(cache: Arc<DataCache>) -> JoinHandle<()> {
             }
 
             let has_incomplete_chunks = cache.chunk_repository.has_incomplete_chunks();
-            dbg!(has_incomplete_chunks);
+
             if !has_incomplete_chunks {
                 // Instead of spin-looping, wait until someone has a new request that we can process
                 log::info!("Processed all open chunk download requests, waiting for new ones.");
@@ -83,7 +134,8 @@ impl DataCache {
             drive_client,
             config,
             waiting_chunks: Mutex::new(RefCell::new(HashMap::new())),
-            chunk_notifier: Arc::new(Notify::new()),
+            download_notifier: Arc::new(Notify::new()),
+            upload_notifier: Arc::new(Notify::new()),
         };
 
         dbg!(&this.object_dir);
@@ -96,6 +148,10 @@ impl DataCache {
         this
     }
 
+    pub fn is_fully_cached(&self, file_id: &str) -> bool {
+        !self.chunk_repository.has_incomplete_chunks_by_file(file_id)
+    }
+
     pub fn get_waiting_chunk_keys(&self) -> Vec<String> {
         self.waiting_chunks
             .lock()
@@ -104,6 +160,33 @@ impl DataCache {
             .keys()
             .cloned()
             .collect()
+    }
+
+    pub fn get_size_on_disk(&self, file_id: &str) -> usize {
+        let chunks = self.chunk_repository.find_chunks_by_file_id(file_id);
+        if chunks.len() == 0 {
+            return 0;
+        }
+
+        chunks
+            .into_iter()
+            .map(|chunk| {
+                std::fs::metadata(self.object_dir.join(&chunk.object_name))
+                    .map(|meta| meta.len())
+                    .unwrap_or(0) as usize
+            })
+            .reduce(|a, b| a + b)
+            .unwrap()
+    }
+
+    pub fn get_chunk_size_on_disk(&self, chunk_id: i64) -> usize {
+        let chunk = self.chunk_repository.find_chunk_by_id(chunk_id);
+        match chunk {
+            Option::Some(chunk) => std::fs::metadata(self.object_dir.join(&chunk.object_name))
+                .unwrap()
+                .len() as usize,
+            Option::None => 0usize,
+        }
     }
 
     pub async fn update_cache_content_from_remote(&self, chunk: ObjectChunk) -> Result<()> {
@@ -157,7 +240,21 @@ impl DataCache {
 
                 log::info!("Successfully downloaded a chunk!")
             }
-            Err(error) => log::error!("Failed to download chunk: {:?}", error),
+            Err(error) => {
+                if error.is::<DriveError>() {
+                    match error.downcast_ref::<DriveError>().unwrap() {
+                        DriveError::NotFound => {
+                            log::warn!(
+                                "Didn't find the file for this chunk on Google Drive. Deleting chunk."
+                            );
+                            self.chunk_repository.delete_chunk(chunk.id);
+                        }
+                        _ => log::error!("Failed to download chunk: {:?}", error),
+                    }
+                } else {
+                    log::error!("Failed to download chunk: {:?}", error);
+                }
+            }
         }
 
         Ok(())
@@ -197,16 +294,23 @@ impl DataCache {
                 chunk_sequence: chunk_index as i32,
                 byte_from: byte_from as i64,
                 byte_to: byte_to as i64,
-                object_name,
+                object_name: object_name.clone(),
                 is_dirty: false,
                 is_complete: false,
             };
+
+            // Ensure the chunk file exists on disk
+            let _ = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .append(true)
+                .open(self.object_dir.join(object_name));
 
             chunks.push(new_chunk);
         }
 
         self.chunk_repository.insert_chunks(chunks);
-        self.chunk_notifier.notify_one();
+        self.download_notifier.notify_one();
     }
 
     pub fn write_bytes(&self, file_id: &str, byte_from: i64, data: &[u8]) -> Result<()> {
@@ -216,7 +320,7 @@ impl DataCache {
         //  - or the bytes exceed the last chunk's current size, which is semi-trivial
         //  - or the bytes exceed the last chunk's current size and also the max chunk size, which is non-trivial
 
-        dbg!("write_bytes()");
+        log::debug!("write_bytes()");
         dbg!(byte_from);
 
         let byte_to = byte_from + data.len() as i64 - 1;
@@ -244,7 +348,7 @@ impl DataCache {
                 .write_all(data)
                 .context("Unable to write to cache file.")?;
 
-            self.chunk_repository.mark_chunk_dirty(chunk.id);
+            log::debug!("2: Wrote {} bytes.", data.len());
 
             return Ok(());
         }
@@ -253,7 +357,7 @@ impl DataCache {
         if chunks.len() > 1 {
             let mut data_cursor = 0usize;
             for chunk in chunks {
-                dbg!(data_cursor);
+                dbg!(data_cursor, chunk.byte_to);
 
                 let relative_start = if byte_from > chunk.byte_from {
                     byte_from - chunk.byte_from
@@ -270,13 +374,14 @@ impl DataCache {
                     .seek(SeekFrom::Start(relative_start))
                     .context("Failed to seek to relative start")?;
 
-                let data_end = std::cmp::min(data.len(), chunk.byte_to as usize - data_cursor);
+                let data_end =
+                    std::cmp::min(data.len(), chunk.byte_to as usize - byte_from as usize);
                 dbg!(data_end);
                 object_file
                     .write_all(&data[data_cursor..data_end])
                     .context("Unable to write to cache file.")?;
 
-                self.chunk_repository.mark_chunk_dirty(chunk.id);
+                log::debug!("3: Wrote {} bytes.", &data[data_cursor..data_end].len());
 
                 data_cursor += data_end;
             }
@@ -296,7 +401,6 @@ impl DataCache {
             // starting point for our writing is after the the end of the currently last chunk.
             // This should not happen very often, so for now we just violently fail here to monitor
             // what the impact is.
-            // TODO: Improve this part so it doesn't generate mini chunks
             if chunks.len() == 0 {
                 let new_byte_from = byte_from;
                 let new_byte_to = new_byte_from + self.config.cache.chunk_size as i64 - 1;
@@ -323,7 +427,7 @@ impl DataCache {
                     id: -1,
                     last_read: None,
                     last_write: None,
-                    is_complete: false,
+                    is_complete: true,
                     is_dirty: true,
                     file_id: String::from(file_id),
                     chunk_sequence: chunk_index,
@@ -361,23 +465,24 @@ impl DataCache {
                     chunk.byte_from as usize + self.config.cache.chunk_size,
                 );
                 dbg!(chunk_max_byte_to);
-                let data_end = std::cmp::min(data.len(), chunk_max_byte_to - data_cursor);
+                let data_end = std::cmp::min(data.len(), chunk_max_byte_to - byte_from as usize);
                 dbg!(data_end);
                 object_file
                     .write_all(&data[data_cursor..data_end])
                     .context("Unable to write to cache file.")?;
 
+                log::debug!("4: Wrote {} bytes.", &data[data_cursor..data_end].len());
+
                 // Since we possibly extended the chunk, we need to recalculate the `byte_to` value
                 // for this chunk
                 let new_byte_to = chunk.byte_from + object_file.metadata().unwrap().len() as i64;
+                dbg!(chunk, new_byte_to);
                 if new_byte_to != chunk.byte_to {
                     self.chunk_repository
                         .update_chunk_byte_to(chunk.id, new_byte_to);
                 }
 
-                self.chunk_repository.mark_chunk_dirty(chunk.id);
-
-                data_cursor += data_end;
+                data_cursor += &data[data_cursor..data_end].len();
                 previous_chunk = chunk.clone();
             }
 
@@ -388,7 +493,7 @@ impl DataCache {
                 let new_byte_to = std::cmp::min(
                     new_byte_from + self.config.cache.chunk_size as i64,
                     byte_from + data.len() as i64,
-                );
+                ) - 1;
 
                 let chunk_index = previous_chunk.chunk_sequence + 1;
 
@@ -413,13 +518,24 @@ impl DataCache {
                     .open(self.object_dir.join(&object_name))
                     .unwrap();
 
-                let data_end = std::cmp::min(data.len(), new_byte_to as usize - data_cursor);
-                dbg!(data_end);
+                let data_end = std::cmp::min(data.len(), new_byte_to as usize - byte_from as usize);
+                dbg!(
+                    previous_chunk,
+                    byte_from,
+                    byte_to,
+                    new_byte_from,
+                    new_byte_to,
+                    data_cursor,
+                    data_end
+                );
+                eprintln!();
                 object_file
                     .write_all(&data[data_cursor..data_end])
                     .context("Unable to write to cache file.")?;
 
-                data_cursor += data_end;
+                log::debug!("1: Wrote {} bytes.", &data[data_cursor..data_end].len());
+
+                data_cursor += &data[data_cursor..data_end].len();
                 previous_chunk = ObjectChunk {
                     id: -1,
                     last_read: None,
@@ -463,20 +579,28 @@ impl DataCache {
                 0
             } as u64;
 
-            let mut object_file = File::open(self.object_dir.join(chunk.object_name))
+            let mut object_file = File::open(self.object_dir.join(chunk.object_name.as_str()))
                 .context("Unable to open cache file")?;
-            let sub_slice = &mut buffer
-                [buffer_cursor..std::cmp::min(end, object_file.metadata().unwrap().len() as usize)];
+            let real_end = std::cmp::min(end, object_file.metadata().unwrap().len() as usize);
+            let sub_slice = &mut buffer[buffer_cursor..real_end];
 
             object_file
                 .seek(SeekFrom::Start(relative_start))
                 .context("Failed to seek to relative start")?;
 
+            log::debug!(
+                "rel_start = {}, end = {}, real_end = {}, chunk = {:?}",
+                relative_start,
+                end,
+                real_end,
+                &chunk
+            );
+
             object_file
                 .read_exact(sub_slice)
                 .context("Unable to read from cache file.")?;
 
-            buffer_cursor += end;
+            buffer_cursor += sub_slice.len();
         }
 
         Ok(buffer.freeze())
@@ -510,7 +634,7 @@ impl DataCache {
             arc
         };
 
-        self.chunk_notifier.notify_one();
+        self.download_notifier.notify_one();
 
         let (mutex, condvar) = &*arc;
         let mut is_complete = mutex.lock().unwrap();

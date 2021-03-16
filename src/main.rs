@@ -40,7 +40,7 @@ embed_migrations!("migrations/");
 async fn main() -> Result<()> {
     SimpleLogger::new()
         .with_level(log::LevelFilter::Info) // Everything from the libs shall be relatively silent
-        .with_module_level("fuse", log::LevelFilter::Debug) // We want to debug native filesystem stuff
+        .with_module_level("fuse", log::LevelFilter::Trace) // We want to debug native filesystem stuff
         .with_module_level(module_path!(), log::LevelFilter::Debug) // For our own crate, we want to "DEBUG"
         .init()
         .unwrap();
@@ -113,14 +113,16 @@ async fn main() -> Result<()> {
 
     log::info!("Starting indexing.");
 
-    let mut drive_index = DriveIndex::new(
+    let drive_index = DriveIndex::new(
         Arc::clone(&drive_client),
         connection_pool.clone(),
         config.clone(),
         shared_drives_inode,
     );
 
-    cache::run_download_worker(cache);
+    cache::run_download_worker(Arc::clone(&cache));
+
+    //cache::run_upload_worker(cache);
 
     drive_index
         .update_drives()

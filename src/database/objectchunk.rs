@@ -18,6 +18,19 @@ impl ObjectCacheChunkRepository {
         Self { connection }
     }
 
+    pub fn delete_chunk(&self, chunk_id: i64) {
+        diesel::delete(object_chunk.filter(id.eq(chunk_id)))
+            .execute(&self.connection.get().unwrap())
+            .expect("Failed to delete chunk");
+    }
+
+    pub fn mark_all_chunks_dirty_for_file(&self, rid: &str) {
+        diesel::update(object_chunk.filter(file_id.eq(rid)))
+            .set((is_dirty.eq(true), is_complete.eq(true)))
+            .execute(&self.connection.get().unwrap())
+            .expect("Failed to update chunks");
+    }
+
     pub fn find_chunks_by_file_id(&self, rid: &str) -> Vec<ObjectChunk> {
         object_chunk
             .filter(file_id.eq(rid))
@@ -33,9 +46,9 @@ impl ObjectCacheChunkRepository {
             .expect("Failed to fetch incomplete chunks")
     }
 
-    pub fn mark_chunk_dirty(&self, chunk_id: i64) {
+    pub fn mark_chunk_clean(&self, chunk_id: i64) {
         diesel::update(object_chunk.filter(id.eq(chunk_id)))
-            .set(is_dirty.eq(true))
+            .set(is_dirty.eq(false))
             .execute(&self.connection.get().unwrap())
             .expect("Failed to mark chunk dirty.");
     }
@@ -46,10 +59,43 @@ impl ObjectCacheChunkRepository {
             .expect("Failed to check for incomplete chunks")
     }
 
+    pub fn has_incomplete_chunks_by_file(&self, rid: &str) -> bool {
+        select(exists(
+            object_chunk
+                .filter(is_complete.eq(false))
+                .filter(file_id.eq(rid)),
+        ))
+        .get_result(&self.connection.get().unwrap())
+        .expect("Failed to check for incomplete chunks")
+    }
+
+    pub fn find_chunk_by_id(&self, chunk_id: i64) -> Option<ObjectChunk> {
+        object_chunk
+            .filter(id.eq(chunk_id))
+            .first::<ObjectChunk>(&self.connection.get().unwrap())
+            .optional()
+            .unwrap()
+    }
+
+    pub fn has_dirty_chunks(&self) -> bool {
+        select(exists(object_chunk.filter(is_dirty.eq(true))))
+            .get_result(&self.connection.get().unwrap())
+            .expect("Failed to check for incomplete chunks")
+    }
+
     pub(crate) fn set_chunk_complete(&self, chunk_id: i64) -> Result<usize> {
         Ok(diesel::update(object_chunk.filter(id.eq(chunk_id)))
             .set(is_complete.eq(true))
             .execute(&self.connection.get().unwrap())?)
+    }
+
+    pub fn find_dirty_files(&self) -> Vec<String> {
+        object_chunk
+            .filter(is_dirty.eq(true))
+            .select(file_id)
+            .distinct()
+            .load::<String>(&self.connection.get().unwrap())
+            .expect("Failed to find dirty files.")
     }
 
     pub fn get_max_sequence_for_file(&self, rid: &str) -> i32 {
